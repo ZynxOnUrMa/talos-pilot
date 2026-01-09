@@ -14,7 +14,12 @@ use ratatui::{
 use std::collections::HashSet;
 
 /// Maximum entries to keep in memory (ring buffer)
+/// At ~500 bytes per entry average, 5000 entries ≈ 2.5MB
 const MAX_ENTRIES: usize = 5000;
+
+/// Maximum lines to process per tick during streaming
+/// Higher = more responsive but could block UI if too high
+const MAX_LINES_PER_TICK: usize = 500;
 
 /// Color palette for services (deterministic assignment)
 const SERVICE_COLORS: &[Color] = &[
@@ -207,6 +212,12 @@ pub struct MultiLogsComponent {
     stream_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
     /// Animation frame for pulsing indicator
     pulse_frame: u8,
+    /// Whether to wrap long lines
+    wrap: bool,
+    /// Visual selection anchor (for V mode) - stores visible_index
+    selection_start: Option<usize>,
+    /// Current cursor position in visible_indices (always tracked, moves with navigation)
+    cursor: usize,
 }
 
 impl MultiLogsComponent {
@@ -267,6 +278,9 @@ impl MultiLogsComponent {
             stream_rx: None,
             stream_tx: None,
             pulse_frame: 0,
+            wrap: false,
+            selection_start: None,
+            cursor: 0,
         }
     }
 
@@ -342,17 +356,30 @@ impl MultiLogsComponent {
                 None => return,
             };
 
-            let mut lines = Vec::new();
+            let mut lines = Vec::with_capacity(MAX_LINES_PER_TICK);
             let mut count = 0;
-            const MAX_PER_TICK: usize = 100; // Prevent overwhelming on large bursts
 
+            // Drain up to MAX_LINES_PER_TICK entries
             while let Ok(item) = rx.try_recv() {
                 lines.push(item);
                 count += 1;
-                if count >= MAX_PER_TICK {
+                if count >= MAX_LINES_PER_TICK {
                     break;
                 }
             }
+
+            // If we hit the limit and there's more, log a warning (channel backing up)
+            if count >= MAX_LINES_PER_TICK {
+                // Check if there's more in the channel (indicates backlog)
+                if rx.try_recv().is_ok() {
+                    tracing::debug!("Log stream channel has backlog, may be dropping older entries");
+                    // Drain remainder to prevent unbounded growth, but don't process
+                    while rx.try_recv().is_ok() {
+                        // Discard to prevent memory growth
+                    }
+                }
+            }
+
             lines
         };
 
@@ -375,18 +402,18 @@ impl MultiLogsComponent {
         // Re-sort (could optimize with insertion sort for streaming)
         self.entries.sort_by_key(|e| e.timestamp_sort);
 
-        // Enforce max entries (ring buffer)
+        // Enforce max entries (ring buffer) - this is the primary memory bound
         if self.entries.len() > MAX_ENTRIES {
-            self.entries.drain(0..self.entries.len() - MAX_ENTRIES);
+            let excess = self.entries.len() - MAX_ENTRIES;
+            self.entries.drain(0..excess);
+            // Shrink capacity periodically to release memory
+            if self.entries.capacity() > MAX_ENTRIES * 2 {
+                self.entries.shrink_to(MAX_ENTRIES + 1000);
+            }
         }
 
         // Update counts
-        for service in &mut self.services {
-            service.entry_count = self.entries.iter().filter(|e| e.service_id == service.id).count();
-        }
-        for level_state in &mut self.levels {
-            level_state.entry_count = self.entries.iter().filter(|e| e.level == level_state.level).count();
-        }
+        self.update_counts();
 
         // Rebuild visible indices
         self.rebuild_visible_indices();
@@ -394,6 +421,30 @@ impl MultiLogsComponent {
         // Auto-scroll if following
         if self.following {
             self.scroll_to_bottom();
+        }
+    }
+
+    /// Update service and level counts
+    /// Service counts show total entries for each service
+    /// Level counts show entries filtered by active services (so you see relevant breakdown)
+    fn update_counts(&mut self) {
+        // Service counts: total entries for each service (not filtered)
+        for service in &mut self.services {
+            service.entry_count = self.entries.iter().filter(|e| e.service_id == service.id).count();
+        }
+
+        // Level counts: filtered by active services
+        let active_services: HashSet<&str> = self.services
+            .iter()
+            .filter(|s| s.active)
+            .map(|s| s.id.as_str())
+            .collect();
+
+        for level_state in &mut self.levels {
+            level_state.entry_count = self.entries
+                .iter()
+                .filter(|e| active_services.contains(e.service_id.as_str()) && e.level == level_state.level)
+                .count();
         }
     }
 
@@ -432,15 +483,8 @@ impl MultiLogsComponent {
             self.entries.drain(0..self.entries.len() - MAX_ENTRIES);
         }
 
-        // Update service entry counts
-        for service in &mut self.services {
-            service.entry_count = self.entries.iter().filter(|e| e.service_id == service.id).count();
-        }
-
-        // Update level entry counts
-        for level_state in &mut self.levels {
-            level_state.entry_count = self.entries.iter().filter(|e| e.level == level_state.level).count();
-        }
+        // Update counts
+        self.update_counts();
 
         // Build visible indices
         self.rebuild_visible_indices();
@@ -511,7 +555,7 @@ impl MultiLogsComponent {
                     let ts_str = rest[..ts_end].trim();
                     // Try to parse as float (ms timestamp)
                     if let Ok(ts_ms) = ts_str.parse::<f64>() {
-                        let (short_ts, sort_key) = Self::unix_ms_to_time(ts_ms);
+                        let (short_ts, sort_key) = Self::unix_ts_to_time(ts_ms);
                         return (short_ts, sort_key, line);
                     }
                     // Try as quoted string
@@ -596,7 +640,7 @@ impl MultiLogsComponent {
     /// Extract HH:MM:SS from any timestamp format
     fn extract_time_part(ts: &str) -> String {
         let bytes = ts.as_bytes();
-        // Look for HH:MM:SS pattern
+        // Look for HH:MM:SS pattern (must have two colons)
         for i in 0..bytes.len().saturating_sub(7) {
             if bytes[i].is_ascii_digit()
                 && bytes[i + 1].is_ascii_digit()
@@ -610,7 +654,7 @@ impl MultiLogsComponent {
                 return ts[i..i + 8].to_string();
             }
         }
-        // Fallback: look for HH:MM pattern
+        // Fallback: look for HH:MM pattern (only take 5 chars to avoid capturing decimals)
         for i in 0..bytes.len().saturating_sub(4) {
             if bytes[i].is_ascii_digit()
                 && bytes[i + 1].is_ascii_digit()
@@ -618,8 +662,8 @@ impl MultiLogsComponent {
                 && bytes[i + 3].is_ascii_digit()
                 && bytes[i + 4].is_ascii_digit()
             {
-                let end = (i + 8).min(ts.len());
-                return ts[i..end].to_string();
+                // Only return HH:MM (5 chars), not HH:MM.XX which would include decimals
+                return ts[i..i + 5].to_string();
             }
         }
         String::new()
@@ -627,14 +671,24 @@ impl MultiLogsComponent {
 
     /// Convert HH:MM:SS to sortable integer (HHMMSS)
     fn time_to_sort_key(time: &str) -> i64 {
-        // Extract just digits from HH:MM:SS format
+        // Extract just digits from HH:MM:SS or HH:MM format
         let digits: String = time.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
         digits.parse().unwrap_or(0)
     }
 
-    /// Convert Unix timestamp in milliseconds to (HH:MM:SS, sort_key)
-    fn unix_ms_to_time(ts_ms: f64) -> (String, i64) {
-        let ts_secs = (ts_ms / 1000.0) as i64;
+    /// Convert Unix timestamp to (HH:MM:SS, sort_key)
+    /// Auto-detects whether timestamp is in seconds or milliseconds
+    fn unix_ts_to_time(ts: f64) -> (String, i64) {
+        // Auto-detect: timestamps < 10^12 are likely seconds, >= 10^12 are milliseconds
+        // Current Unix time in seconds is ~1.7 billion (2024), in ms it's ~1.7 trillion
+        let ts_secs = if ts >= 1_000_000_000_000.0 {
+            // Milliseconds
+            (ts / 1000.0) as i64
+        } else {
+            // Seconds (with possible fractional part)
+            ts as i64
+        };
+
         let secs_in_day = ts_secs % 86400;
         let hours = secs_in_day / 3600;
         let minutes = (secs_in_day % 3600) / 60;
@@ -698,8 +752,10 @@ impl MultiLogsComponent {
             .map(|(i, _)| i)
             .collect();
 
-        // Clamp scroll to valid range
-        let max_scroll = self.visible_indices.len().saturating_sub(1) as u16;
+        // Clamp scroll to valid range (max is where last entry is at viewport bottom)
+        let total = self.visible_indices.len();
+        let viewport = self.viewport_height as usize;
+        let max_scroll = total.saturating_sub(viewport) as u16;
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
@@ -714,6 +770,7 @@ impl MultiLogsComponent {
     fn toggle_service(&mut self, index: usize) {
         if let Some(service) = self.services.get_mut(index) {
             service.active = !service.active;
+            self.update_counts(); // Level counts depend on active services
             self.rebuild_visible_indices();
         }
     }
@@ -723,6 +780,7 @@ impl MultiLogsComponent {
         for service in &mut self.services {
             service.active = true;
         }
+        self.update_counts();
         self.rebuild_visible_indices();
     }
 
@@ -731,6 +789,7 @@ impl MultiLogsComponent {
         for service in &mut self.services {
             service.active = false;
         }
+        self.update_counts();
         self.rebuild_visible_indices();
     }
 
@@ -776,7 +835,10 @@ impl MultiLogsComponent {
 
     /// Scroll down
     fn scroll_down(&mut self, amount: u16) {
-        let max = self.visible_indices.len().saturating_sub(1) as u16;
+        let total = self.visible_indices.len();
+        let viewport = self.viewport_height as usize;
+        // Max scroll is where last entry is at bottom of viewport
+        let max = total.saturating_sub(viewport) as u16;
         self.scroll = (self.scroll + amount).min(max);
     }
 
@@ -793,9 +855,119 @@ impl MultiLogsComponent {
     }
 
     /// Scroll to bottom and enable following
+    /// Sets scroll so the last entries fill the viewport from the bottom
+    /// Also moves cursor to the last entry
     fn scroll_to_bottom(&mut self) {
-        self.scroll = self.visible_indices.len().saturating_sub(1) as u16;
+        let total = self.visible_indices.len();
+        let viewport = self.viewport_height as usize;
+        // Position scroll so last entry is at bottom of viewport
+        self.scroll = total.saturating_sub(viewport) as u16;
+        // Move cursor to last entry
+        self.cursor = total.saturating_sub(1);
         self.following = true;
+    }
+
+    /// Get the entry at the cursor position
+    fn current_entry(&self) -> Option<&MultiLogEntry> {
+        self.visible_indices.get(self.cursor).and_then(|&i| self.entries.get(i))
+    }
+
+    /// Check if visual selection mode is active
+    fn in_visual_mode(&self) -> bool {
+        self.selection_start.is_some()
+    }
+
+    /// Get the selection range (start, end) in visible indices, inclusive
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_start.map(|anchor| {
+            (anchor.min(self.cursor), anchor.max(self.cursor))
+        })
+    }
+
+    /// Check if a visible index is the cursor position
+    fn is_cursor(&self, visible_idx: usize) -> bool {
+        visible_idx == self.cursor
+    }
+
+    /// Check if a visible index is within the selection
+    fn is_selected(&self, visible_idx: usize) -> bool {
+        if let Some((start, end)) = self.selection_range() {
+            visible_idx >= start && visible_idx <= end
+        } else {
+            false
+        }
+    }
+
+    /// Format a log entry as a string
+    fn format_entry(entry: &MultiLogEntry) -> String {
+        format!(
+            "{} {} {} {}",
+            entry.timestamp,
+            entry.service_id,
+            entry.level.badge(),
+            entry.message
+        )
+    }
+
+    /// Yank (copy) selected lines or current line to system clipboard
+    fn yank_selection(&self) -> (bool, usize) {
+        let lines: Vec<String> = if let Some((start, end)) = self.selection_range() {
+            // Yank all selected lines
+            (start..=end)
+                .filter_map(|vi| {
+                    self.visible_indices.get(vi)
+                        .and_then(|&i| self.entries.get(i))
+                        .map(Self::format_entry)
+                })
+                .collect()
+        } else {
+            // Yank current line only
+            self.current_entry()
+                .map(|e| vec![Self::format_entry(e)])
+                .unwrap_or_default()
+        };
+
+        if lines.is_empty() {
+            return (false, 0);
+        }
+
+        let count = lines.len();
+        let content = lines.join("\n");
+
+        // Try to copy to clipboard using system tools
+        let result = if cfg!(target_os = "macos") {
+            std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(content.as_bytes())?;
+                    }
+                    child.wait()
+                })
+        } else {
+            // Try xclip first, then xsel
+            std::process::Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .or_else(|_| {
+                    std::process::Command::new("xsel")
+                        .args(["--clipboard", "--input"])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                })
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(content.as_bytes())?;
+                    }
+                    child.wait()
+                })
+        };
+
+        (result.map(|s| s.success()).unwrap_or(false), count)
     }
 
     /// Update search matches
@@ -1056,10 +1228,11 @@ impl MultiLogsComponent {
         let visible_height = area.height as usize;
         let content_width = area.width.saturating_sub(1) as usize; // -1 for scrollbar
 
-        // Safety clamp scroll to valid range
-        let max_start = self.visible_indices.len().saturating_sub(1);
+        // Safety clamp scroll to valid range (max is where last entry is at viewport bottom)
+        let total = self.visible_indices.len();
+        let max_start = total.saturating_sub(visible_height);
         let start = (self.scroll as usize).min(max_start);
-        let end = (start + visible_height).min(self.visible_indices.len());
+        let end = (start + visible_height).min(total);
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -1068,12 +1241,18 @@ impl MultiLogsComponent {
             let entry = &self.entries[entry_idx];
             let is_current_match = self.is_current_match(visible_idx);
             let is_match = self.entry_matches(visible_idx);
+            let is_selected = self.is_selected(visible_idx);
 
             let mut spans = Vec::new();
+            let is_cursor = self.is_cursor(visible_idx);
 
-            // Match indicator
-            if is_current_match {
+            // Selection/match/cursor indicator
+            if is_selected {
+                spans.push(Span::styled("█", Style::default().fg(Color::Magenta)));
+            } else if is_current_match {
                 spans.push(Span::styled("▶", Style::default().fg(Color::Yellow)));
+            } else if is_cursor {
+                spans.push(Span::styled(">", Style::default().fg(Color::Cyan)));
             } else {
                 spans.push(Span::raw(" "));
             }
@@ -1108,13 +1287,46 @@ impl MultiLogsComponent {
             let prefix_width = 1 + 8 + 1 + 12 + 1 + 3 + 1; // indicator + time + service + level
             let available = content_width.saturating_sub(prefix_width);
 
-            if entry.message.len() <= available {
+            if self.wrap && entry.message.len() > available {
+                // Wrap mode: split message into multiple lines
+                let msg_chars: Vec<char> = entry.message.chars().collect();
+                let mut chunk_start = 0;
+
+                while chunk_start < msg_chars.len() {
+                    let chunk_end = (chunk_start + available).min(msg_chars.len());
+                    let chunk: String = msg_chars[chunk_start..chunk_end].iter().collect();
+
+                    if chunk_start == 0 {
+                        // First line: use the prefix spans we already built
+                        if is_match && !self.search_query.is_empty() {
+                            spans.extend(self.render_message_with_highlight(&chunk, is_current_match));
+                        } else {
+                            spans.push(Span::raw(chunk));
+                        }
+                        lines.push(Line::from(spans.clone()));
+                        spans.clear();
+                    } else {
+                        // Continuation lines: indent to align with message start
+                        let indent = " ".repeat(prefix_width);
+                        let mut cont_spans = vec![Span::raw(indent)];
+                        if is_match && !self.search_query.is_empty() {
+                            cont_spans.extend(self.render_message_with_highlight(&chunk, is_current_match));
+                        } else {
+                            cont_spans.push(Span::raw(chunk));
+                        }
+                        lines.push(Line::from(cont_spans));
+                    }
+                    chunk_start = chunk_end;
+                }
+            } else if entry.message.len() <= available {
                 if is_match && !self.search_query.is_empty() {
                     spans.extend(self.render_message_with_highlight(&entry.message, is_current_match));
                 } else {
                     spans.push(Span::raw(entry.message.clone()));
                 }
+                lines.push(Line::from(spans));
             } else {
+                // Truncate mode
                 let truncated: String = entry.message.chars().take(available.saturating_sub(1)).collect();
                 if is_match && !self.search_query.is_empty() {
                     spans.extend(self.render_message_with_highlight(&truncated, is_current_match));
@@ -1122,9 +1334,8 @@ impl MultiLogsComponent {
                     spans.push(Span::raw(truncated));
                 }
                 spans.push(Span::raw("…").dim());
+                lines.push(Line::from(spans));
             }
-
-            lines.push(Line::from(spans));
         }
 
         let logs = Paragraph::new(lines);
@@ -1179,7 +1390,9 @@ impl Component for MultiLogsComponent {
                 Ok(Some(Action::Back))
             }
             KeyCode::Esc => {
-                if self.search_mode == SearchMode::Active {
+                if self.in_visual_mode() {
+                    self.selection_start = None;
+                } else if self.search_mode == SearchMode::Active {
                     self.clear_search();
                 } else if self.floating_pane != FloatingPane::None {
                     self.floating_pane = FloatingPane::None;
@@ -1217,7 +1430,7 @@ impl Component for MultiLogsComponent {
                 Ok(None)
             }
 
-            // Navigation - when a pane is open, navigate the pane
+            // Navigation - when a pane is open, navigate the pane; otherwise move cursor
             KeyCode::Up | KeyCode::Char('k') => {
                 match self.floating_pane {
                     FloatingPane::Services => {
@@ -1229,7 +1442,13 @@ impl Component for MultiLogsComponent {
                         self.levels_state.select(Some(self.selected_level));
                     }
                     FloatingPane::None => {
-                        self.scroll_up(1);
+                        // Always move cursor up
+                        self.cursor = self.cursor.saturating_sub(1);
+                        // Scroll viewport if cursor goes above visible area
+                        if self.cursor < self.scroll as usize {
+                            self.scroll = self.cursor as u16;
+                        }
+                        self.following = false;
                     }
                 }
                 Ok(None)
@@ -1245,36 +1464,82 @@ impl Component for MultiLogsComponent {
                         self.levels_state.select(Some(self.selected_level));
                     }
                     FloatingPane::None => {
-                        self.scroll_down(1);
+                        // Always move cursor down
+                        let max_idx = self.visible_indices.len().saturating_sub(1);
+                        self.cursor = (self.cursor + 1).min(max_idx);
+                        // Scroll viewport if cursor goes below visible area
+                        let viewport = self.viewport_height as usize;
+                        let visible_end = self.scroll as usize + viewport;
+                        if self.cursor >= visible_end {
+                            self.scroll = (self.cursor + 1).saturating_sub(viewport) as u16;
+                        }
+                        self.following = false;
                     }
                 }
                 Ok(None)
             }
             KeyCode::PageUp => {
-                self.scroll_up(20);
+                // Always move cursor
+                self.cursor = self.cursor.saturating_sub(20);
+                if self.cursor < self.scroll as usize {
+                    self.scroll = self.cursor as u16;
+                }
+                self.following = false;
                 Ok(None)
             }
             KeyCode::PageDown => {
-                self.scroll_down(20);
+                // Always move cursor
+                let max_idx = self.visible_indices.len().saturating_sub(1);
+                self.cursor = (self.cursor + 20).min(max_idx);
+                let viewport = self.viewport_height as usize;
+                let visible_end = self.scroll as usize + viewport;
+                if self.cursor >= visible_end {
+                    self.scroll = (self.cursor + 1).saturating_sub(viewport) as u16;
+                }
+                self.following = false;
                 Ok(None)
             }
 
             // Vim-style half-page scroll
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_half_page_up();
+                let half = (self.viewport_height / 2).max(1) as usize;
+                // Always move cursor up by half page
+                self.cursor = self.cursor.saturating_sub(half);
+                // Scroll to keep cursor visible
+                if self.cursor < self.scroll as usize {
+                    self.scroll = self.cursor as u16;
+                }
+                self.following = false;
                 Ok(None)
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_half_page_down();
+                let half = (self.viewport_height / 2).max(1) as usize;
+                // Always move cursor down by half page
+                let max_idx = self.visible_indices.len().saturating_sub(1);
+                self.cursor = (self.cursor + half).min(max_idx);
+                // Scroll to keep cursor visible
+                let viewport = self.viewport_height as usize;
+                let visible_end = self.scroll as usize + viewport;
+                if self.cursor >= visible_end {
+                    self.scroll = (self.cursor + 1).saturating_sub(viewport) as u16;
+                }
+                self.following = false;
                 Ok(None)
             }
             KeyCode::Home | KeyCode::Char('g') => {
+                // Always move cursor to top
+                self.cursor = 0;
                 self.scroll = 0;
                 self.following = false;
                 Ok(None)
             }
             KeyCode::Char('G') => {
-                self.scroll_to_bottom();
+                // Always move cursor to bottom
+                let max_idx = self.visible_indices.len().saturating_sub(1);
+                self.cursor = max_idx;
+                let viewport = self.viewport_height as usize;
+                self.scroll = self.visible_indices.len().saturating_sub(viewport) as u16;
+                self.following = true;
                 Ok(None)
             }
 
@@ -1341,6 +1606,35 @@ impl Component for MultiLogsComponent {
                 } else {
                     self.start_streaming();
                 }
+                Ok(None)
+            }
+
+            // Toggle line wrapping
+            KeyCode::Char('w') => {
+                self.wrap = !self.wrap;
+                Ok(None)
+            }
+
+            // Visual line selection mode
+            KeyCode::Char('V') => {
+                if self.in_visual_mode() {
+                    // Toggle off
+                    self.selection_start = None;
+                } else {
+                    // Start selection at current cursor position
+                    self.selection_start = Some(self.cursor);
+                }
+                Ok(None)
+            }
+
+            // Yank selection or current line to clipboard
+            KeyCode::Char('y') => {
+                let (success, count) = self.yank_selection();
+                if success {
+                    tracing::info!("Copied {} log entries to clipboard", count);
+                }
+                // Clear visual selection after yank
+                self.selection_start = None;
                 Ok(None)
             }
 
@@ -1418,6 +1712,16 @@ impl Component for MultiLogsComponent {
         } else if self.search_mode != SearchMode::Off && !self.search_query.is_empty() {
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled("[no matches]", Style::default().fg(Color::Red)));
+        }
+
+        // Show visual selection indicator
+        if let Some((start, end)) = self.selection_range() {
+            let count = end - start + 1;
+            header_spans.push(Span::raw("  "));
+            header_spans.push(Span::styled(
+                format!("-- VISUAL ({} lines) --", count),
+                Style::default().fg(Color::Magenta).bold(),
+            ));
         }
 
         let header = Paragraph::new(Line::from(header_spans)).block(
@@ -1516,24 +1820,46 @@ impl Component for MultiLogsComponent {
                 Span::raw("[q]").fg(Color::Yellow),
                 Span::raw(" back").dim(),
             ]
+        } else if self.in_visual_mode() {
+            // Visual mode footer
+            vec![
+                Span::raw(" [j/k]").fg(Color::Yellow),
+                Span::raw(" extend").dim(),
+                Span::raw(" "),
+                Span::raw("[y]").fg(Color::Yellow),
+                Span::raw(" yank").dim(),
+                Span::raw(" "),
+                Span::raw("[Esc/V]").fg(Color::Yellow),
+                Span::raw(" cancel").dim(),
+            ]
         } else {
             let stream_text = if self.streaming { " stop" } else { " stream" };
+            let wrap_text = if self.wrap { " nowrap" } else { " wrap" };
             vec![
                 Span::raw(" [s]").fg(Color::Yellow),
-                Span::raw(" services").dim(),
-                Span::raw("  "),
+                Span::raw(" svcs").dim(),
+                Span::raw(" "),
                 Span::raw("[l]").fg(Color::Yellow),
-                Span::raw(" levels").dim(),
-                Span::raw("  "),
+                Span::raw(" lvls").dim(),
+                Span::raw(" "),
                 Span::raw("[/]").fg(Color::Yellow),
                 Span::raw(" search").dim(),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::raw("[f]").fg(Color::Yellow),
                 Span::raw(" follow").dim(),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::raw("[F]").fg(Color::Yellow),
                 Span::raw(stream_text).dim(),
-                Span::raw("  "),
+                Span::raw(" "),
+                Span::raw("[w]").fg(Color::Yellow),
+                Span::raw(wrap_text).dim(),
+                Span::raw(" "),
+                Span::raw("[V]").fg(Color::Yellow),
+                Span::raw(" visual").dim(),
+                Span::raw(" "),
+                Span::raw("[y]").fg(Color::Yellow),
+                Span::raw(" yank").dim(),
+                Span::raw(" "),
                 Span::raw("[q]").fg(Color::Yellow),
                 Span::raw(" back").dim(),
             ]

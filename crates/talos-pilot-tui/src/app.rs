@@ -221,6 +221,8 @@ impl App {
                     match client.logs_multi(&service_refs, self.tail_lines).await {
                         Ok(logs) => {
                             multi_logs.set_logs(logs);
+                            // Auto-start streaming for live updates
+                            multi_logs.start_streaming();
                         }
                         Err(e) => {
                             multi_logs.set_error(e.to_string());
