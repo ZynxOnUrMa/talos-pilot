@@ -11,9 +11,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table},
     Frame,
 };
+use std::collections::HashMap;
 use talos_rs::{
-    MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices, ServiceInfo, TalosClient,
-    VersionInfo,
+    EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices, ServiceInfo,
+    TalosClient, VersionInfo,
 };
 
 /// Simple etcd status for header display
@@ -45,8 +46,12 @@ pub struct ClusterComponent {
     load_avg: Vec<NodeLoadAvg>,
     /// CPU info from nodes
     cpu_info: Vec<NodeCpuInfo>,
+    /// Etcd members (for extracting node IPs)
+    etcd_members: Vec<EtcdMemberInfo>,
     /// Etcd summary for header
     etcd_summary: Option<EtcdSummary>,
+    /// Node hostname to IP mapping (discovered from etcd members)
+    node_ips: HashMap<String, String>,
     /// Currently selected node index
     selected: usize,
     /// Currently selected service index within the node
@@ -87,7 +92,9 @@ impl ClusterComponent {
             memory: Vec::new(),
             load_avg: Vec::new(),
             cpu_info: Vec::new(),
+            etcd_members: Vec::new(),
             etcd_summary: None,
+            node_ips: HashMap::new(),
             selected: 0,
             selected_service: 0,
             list_state,
@@ -127,37 +134,134 @@ impl ClusterComponent {
     /// Refresh cluster data from API
     pub async fn refresh(&mut self) -> Result<()> {
         if let Some(client) = &self.client {
-            // Fetch all data
-            match client.version().await {
-                Ok(versions) => self.versions = versions,
-                Err(e) => self.error = Some(format!("Version error: {}", e)),
+            // First, fetch etcd members to discover node IPs
+            // This is critical for Docker provisioner where metadata.hostname is empty
+            match client.etcd_members().await {
+                Ok(members) => {
+                    // Build hostname -> IP mapping (only hostname keys, not IP->IP)
+                    self.node_ips.clear();
+                    for member in &members {
+                        if let Some(ip) = member.ip_address() {
+                            // Map hostname to IP
+                            self.node_ips.insert(member.hostname.clone(), ip);
+                        }
+                    }
+                    self.etcd_members = members;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch etcd members: {}", e);
+                }
             }
 
-            match client.services().await {
-                Ok(services) => self.services = services,
-                Err(e) => self.error = Some(format!("Services error: {}", e)),
-            }
+            // If we have discovered node IPs, use them to get proper data with hostnames
+            // Otherwise fall back to the default (which may have empty hostnames)
+            if !self.etcd_members.is_empty() {
+                // Get all data from each node using discovered IPs
+                let mut versions = Vec::new();
+                let mut services = Vec::new();
+                let mut memory = Vec::new();
+                let mut load_avg = Vec::new();
+                let mut cpu_info = Vec::new();
 
-            match client.memory().await {
-                Ok(memory) => self.memory = memory,
-                Err(e) => self.error = Some(format!("Memory error: {}", e)),
-            }
+                for member in &self.etcd_members {
+                    if let Some(ip) = member.ip_address() {
+                        let node_client = client.with_node(&ip);
+                        let node_name = if !member.hostname.is_empty() {
+                            member.hostname.clone()
+                        } else {
+                            ip.clone()
+                        };
 
-            match client.load_avg().await {
-                Ok(load_avg) => self.load_avg = load_avg,
-                Err(e) => self.error = Some(format!("LoadAvg error: {}", e)),
-            }
+                        // Version
+                        if let Ok(mut node_versions) = node_client.version().await {
+                            for v in &mut node_versions {
+                                v.node = node_name.clone();
+                            }
+                            versions.extend(node_versions);
+                        }
 
-            match client.cpu_info().await {
-                Ok(cpu_info) => self.cpu_info = cpu_info,
-                Err(e) => self.error = Some(format!("CPUInfo error: {}", e)),
+                        // Services
+                        if let Ok(mut node_services) = node_client.services().await {
+                            for s in &mut node_services {
+                                s.node = node_name.clone();
+                            }
+                            services.extend(node_services);
+                        }
+
+                        // Memory
+                        if let Ok(mut node_memory) = node_client.memory().await {
+                            for m in &mut node_memory {
+                                m.node = node_name.clone();
+                            }
+                            memory.extend(node_memory);
+                        }
+
+                        // Load average
+                        if let Ok(mut node_load) = node_client.load_avg().await {
+                            for l in &mut node_load {
+                                l.node = node_name.clone();
+                            }
+                            load_avg.extend(node_load);
+                        }
+
+                        // CPU info
+                        if let Ok(mut node_cpu) = node_client.cpu_info().await {
+                            for c in &mut node_cpu {
+                                c.node = node_name.clone();
+                            }
+                            cpu_info.extend(node_cpu);
+                        }
+                    }
+                }
+
+                if !versions.is_empty() {
+                    self.versions = versions;
+                }
+                if !services.is_empty() {
+                    self.services = services;
+                }
+                if !memory.is_empty() {
+                    self.memory = memory;
+                }
+                if !load_avg.is_empty() {
+                    self.load_avg = load_avg;
+                }
+                if !cpu_info.is_empty() {
+                    self.cpu_info = cpu_info;
+                }
+            } else {
+                // Fallback: fetch without targeting (may have empty hostnames)
+                match client.version().await {
+                    Ok(versions) => self.versions = versions,
+                    Err(e) => self.error = Some(format!("Version error: {}", e)),
+                }
+
+                match client.services().await {
+                    Ok(services) => self.services = services,
+                    Err(e) => self.error = Some(format!("Services error: {}", e)),
+                }
+
+                match client.memory().await {
+                    Ok(memory) => self.memory = memory,
+                    Err(e) => self.error = Some(format!("Memory error: {}", e)),
+                }
+
+                match client.load_avg().await {
+                    Ok(load_avg) => self.load_avg = load_avg,
+                    Err(e) => self.error = Some(format!("LoadAvg error: {}", e)),
+                }
+
+                match client.cpu_info().await {
+                    Ok(cpu_info) => self.cpu_info = cpu_info,
+                    Err(e) => self.error = Some(format!("CPUInfo error: {}", e)),
+                }
             }
 
             // Fetch etcd status for header summary
-            match (client.etcd_members().await, client.etcd_status().await) {
-                (Ok(members), Ok(statuses)) => {
-                    let total = members.len();
-                    let healthy = statuses.len(); // Status only returned for reachable members
+            match client.etcd_status().await {
+                Ok(statuses) => {
+                    let total = self.etcd_members.len();
+                    let healthy = statuses.len();
                     let quorum_needed = total / 2 + 1;
                     self.etcd_summary = Some(EtcdSummary {
                         healthy,
@@ -165,8 +269,8 @@ impl ClusterComponent {
                         has_quorum: healthy >= quorum_needed,
                     });
                 }
-                _ => {
-                    // Don't overwrite existing summary on error, just leave it
+                Err(_) => {
+                    // Don't overwrite existing summary on error
                 }
             }
 
@@ -329,6 +433,18 @@ impl Component for ClusterComponent {
                 // View etcd cluster status
                 Ok(Some(Action::ShowEtcd))
             }
+            KeyCode::Char('p') => {
+                // View processes for current node
+                if let Some(node_name) = self.current_node_name() {
+                    // Look up the IP address for this node
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    tracing::info!("Cluster: pressing p, node_name='{}', ip='{}'", node_name, node_ip);
+                    Ok(Some(Action::ShowProcesses(node_name, node_ip)))
+                } else {
+                    tracing::warn!("Cluster: pressing p, but no node selected");
+                    Ok(None)
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -427,6 +543,9 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::raw("[e]").fg(Color::Yellow),
             Span::raw(" etcd").dim(),
+            Span::raw("  "),
+            Span::raw("[p]").fg(Color::Yellow),
+            Span::raw(" procs").dim(),
         ]))
         .block(
             Block::default()
@@ -450,6 +569,18 @@ impl ClusterComponent {
                     "node-0".to_string()
                 } else {
                     v.node.clone()
+                };
+
+                // Get the IP for this node (if different from hostname)
+                let node_ip = self.node_ips.get(&node_name).cloned();
+                let display_name = if let Some(ref ip) = node_ip {
+                    if ip != &node_name {
+                        format!("{} ({})", node_name, ip)
+                    } else {
+                        node_name.clone()
+                    }
+                } else {
+                    node_name.clone()
                 };
 
                 // Get health status from services
@@ -484,7 +615,7 @@ impl ClusterComponent {
 
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(" {} ", health_symbol)).fg(health_color),
-                    Span::raw(node_name).style(style),
+                    Span::raw(display_name).style(style),
                 ]))
             })
             .collect();

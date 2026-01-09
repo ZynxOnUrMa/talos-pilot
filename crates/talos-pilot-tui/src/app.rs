@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, EtcdComponent, MultiLogsComponent};
+use crate::components::{ClusterComponent, Component, EtcdComponent, MultiLogsComponent, ProcessesComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -14,6 +14,7 @@ enum View {
     Cluster,
     MultiLogs,
     Etcd,
+    Processes,
 }
 
 /// Main application state
@@ -28,6 +29,8 @@ pub struct App {
     multi_logs: Option<MultiLogsComponent>,
     /// Etcd status component (created when viewing etcd)
     etcd: Option<EtcdComponent>,
+    /// Processes component (created when viewing processes)
+    processes: Option<ProcessesComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -63,6 +66,7 @@ impl App {
             cluster: ClusterComponent::new(context),
             multi_logs: None,
             etcd: None,
+            processes: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -110,6 +114,11 @@ impl App {
                             let _ = etcd.draw(frame, area);
                         }
                     }
+                    View::Processes => {
+                        if let Some(processes) = &mut self.processes {
+                            let _ = processes.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -129,6 +138,13 @@ impl App {
                             View::Etcd => {
                                 if let Some(etcd) = &mut self.etcd {
                                     etcd.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Processes => {
+                                if let Some(processes) = &mut self.processes {
+                                    processes.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -196,6 +212,9 @@ impl App {
                     View::Etcd => {
                         self.etcd = None;
                     }
+                    View::Processes => {
+                        self.processes = None;
+                    }
                     View::Cluster => {}
                 }
                 // Return to cluster view
@@ -223,6 +242,13 @@ impl App {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
                     }
+                    View::Processes => {
+                        if let Some(processes) = &mut self.processes
+                            && let Some(next_action) = processes.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
                 }
             }
             Action::Resize(_w, _h) => {
@@ -238,6 +264,13 @@ impl App {
                         if let Some(etcd) = &mut self.etcd {
                             if let Err(e) = etcd.refresh().await {
                                 etcd.set_error(e.to_string());
+                            }
+                        }
+                    }
+                    View::Processes => {
+                        if let Some(processes) = &mut self.processes {
+                            if let Err(e) = processes.refresh().await {
+                                processes.set_error(e.to_string());
                             }
                         }
                     }
@@ -299,6 +332,28 @@ impl App {
                 self.etcd = Some(etcd);
                 self.view = View::Etcd;
             }
+            Action::ShowProcesses(hostname, address) => {
+                // Switch to processes view for a node
+                tracing::info!("ShowProcesses: hostname='{}', address='{}'", hostname, address);
+
+                // Create processes component
+                let mut processes = ProcessesComponent::new(hostname, address.clone());
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    // Create a client configured for this specific node
+                    let node_client = client.with_node(&address);
+                    tracing::info!("Created node client for address: '{}'", address);
+                    processes.set_client(node_client);
+                    if let Err(e) = processes.refresh().await {
+                        tracing::error!("Process refresh error: {:?}", e);
+                        processes.set_error(e.to_string());
+                    }
+                }
+
+                self.processes = Some(processes);
+                self.view = View::Processes;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -317,6 +372,13 @@ impl App {
                     View::Etcd => {
                         if let Some(etcd) = &mut self.etcd
                             && let Some(next_action) = etcd.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Processes => {
+                        if let Some(processes) = &mut self.processes
+                            && let Some(next_action) = processes.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

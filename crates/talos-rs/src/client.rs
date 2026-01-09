@@ -44,6 +44,16 @@ impl TalosClient {
         Self::from_context(ctx).await
     }
 
+    /// Create a new client targeting a specific node
+    ///
+    /// This returns a clone of the client with requests directed to the specified node.
+    pub fn with_node(&self, node: &str) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            nodes: vec![node.to_string()],
+        }
+    }
+
     /// Get a MachineService client
     fn machine_client(&self) -> MachineServiceClient<Channel> {
         MachineServiceClient::new(self.channel.clone())
@@ -436,6 +446,41 @@ impl TalosClient {
 
         Ok(alarms)
     }
+
+    /// Get processes from all configured nodes
+    pub async fn processes(&self) -> Result<Vec<NodeProcesses>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.processes(request).await?;
+        let inner = response.into_inner();
+
+        let mut result = Vec::new();
+        for msg in inner.messages {
+            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+
+            let processes: Vec<ProcessInfo> = msg
+                .processes
+                .into_iter()
+                .map(|p| ProcessInfo {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    state: ProcessState::from_str(&p.state),
+                    threads: p.threads,
+                    cpu_time: p.cpu_time,
+                    virtual_memory: p.virtual_memory,
+                    resident_memory: p.resident_memory,
+                    command: p.command,
+                    executable: p.executable,
+                    args: p.args,
+                })
+                .collect();
+
+            result.push(NodeProcesses { hostname, processes });
+        }
+
+        Ok(result)
+    }
 }
 
 /// Version information for a node
@@ -529,6 +574,20 @@ pub struct EtcdMemberInfo {
     pub peer_urls: Vec<String>,
     pub client_urls: Vec<String>,
     pub is_learner: bool,
+}
+
+impl EtcdMemberInfo {
+    /// Extract IP address from peer_urls
+    /// e.g., "https://10.5.0.2:2380" -> "10.5.0.2"
+    pub fn ip_address(&self) -> Option<String> {
+        self.peer_urls.first().and_then(|url| {
+            // Parse URL like "https://10.5.0.2:2380"
+            url.split("://")
+                .nth(1)
+                .and_then(|host_port| host_port.split(':').next())
+                .map(|s| s.to_string())
+        })
+    }
 }
 
 /// Etcd member status (from status call)
@@ -641,5 +700,149 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+// ==================== Process Types ====================
+
+/// Processes running on a node
+#[derive(Debug, Clone)]
+pub struct NodeProcesses {
+    /// Node hostname
+    pub hostname: String,
+    /// Processes on this node
+    pub processes: Vec<ProcessInfo>,
+}
+
+/// Information about a single process
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    /// Process ID
+    pub pid: i32,
+    /// Parent process ID
+    pub ppid: i32,
+    /// Process state
+    pub state: ProcessState,
+    /// Number of threads
+    pub threads: i32,
+    /// Cumulative CPU time in seconds
+    pub cpu_time: f64,
+    /// Virtual memory size in bytes
+    pub virtual_memory: u64,
+    /// Resident memory size in bytes
+    pub resident_memory: u64,
+    /// Short command name
+    pub command: String,
+    /// Full path to executable
+    pub executable: String,
+    /// Full command line arguments
+    pub args: String,
+}
+
+impl ProcessInfo {
+    /// Get resident memory in human-readable format
+    pub fn resident_memory_human(&self) -> String {
+        format_bytes(self.resident_memory)
+    }
+
+    /// Get virtual memory in human-readable format
+    pub fn virtual_memory_human(&self) -> String {
+        format_bytes(self.virtual_memory)
+    }
+
+    /// Get CPU time in human-readable format (e.g., "847.2s" or "2h 14m")
+    pub fn cpu_time_human(&self) -> String {
+        if self.cpu_time < 60.0 {
+            format!("{:.1}s", self.cpu_time)
+        } else if self.cpu_time < 3600.0 {
+            let mins = (self.cpu_time / 60.0) as u32;
+            let secs = (self.cpu_time % 60.0) as u32;
+            format!("{}m {}s", mins, secs)
+        } else {
+            let hours = (self.cpu_time / 3600.0) as u32;
+            let mins = ((self.cpu_time % 3600.0) / 60.0) as u32;
+            format!("{}h {}m", hours, mins)
+        }
+    }
+
+    /// Get the display command - args if available, otherwise command name
+    pub fn display_command(&self) -> &str {
+        if !self.args.is_empty() {
+            &self.args
+        } else if !self.executable.is_empty() {
+            &self.executable
+        } else {
+            &self.command
+        }
+    }
+}
+
+/// Process state (Linux process states)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessState {
+    /// R - Running or runnable
+    Running,
+    /// S - Interruptible sleep
+    Sleeping,
+    /// D - Uninterruptible sleep (usually I/O)
+    DiskSleep,
+    /// Z - Zombie (terminated but not reaped by parent)
+    Zombie,
+    /// T - Stopped (by signal or debugger)
+    Stopped,
+    /// t - Tracing stop
+    TracingStop,
+    /// X - Dead (should never be seen)
+    Dead,
+    /// Unknown state
+    Unknown(String),
+}
+
+impl ProcessState {
+    /// Parse state from string (e.g., "R", "S", "D", "Z")
+    pub fn from_str(s: &str) -> Self {
+        match s.chars().next() {
+            Some('R') => ProcessState::Running,
+            Some('S') => ProcessState::Sleeping,
+            Some('D') => ProcessState::DiskSleep,
+            Some('Z') => ProcessState::Zombie,
+            Some('T') => ProcessState::Stopped,
+            Some('t') => ProcessState::TracingStop,
+            Some('X') => ProcessState::Dead,
+            _ => ProcessState::Unknown(s.to_string()),
+        }
+    }
+
+    /// Get single-character representation
+    pub fn short(&self) -> &str {
+        match self {
+            ProcessState::Running => "R",
+            ProcessState::Sleeping => "S",
+            ProcessState::DiskSleep => "D",
+            ProcessState::Zombie => "Z",
+            ProcessState::Stopped => "T",
+            ProcessState::TracingStop => "t",
+            ProcessState::Dead => "X",
+            ProcessState::Unknown(s) => s.get(0..1).unwrap_or("?"),
+        }
+    }
+
+    /// Get human-readable description
+    pub fn description(&self) -> &str {
+        match self {
+            ProcessState::Running => "Running",
+            ProcessState::Sleeping => "Sleeping",
+            ProcessState::DiskSleep => "Disk Sleep",
+            ProcessState::Zombie => "Zombie",
+            ProcessState::Stopped => "Stopped",
+            ProcessState::TracingStop => "Tracing",
+            ProcessState::Dead => "Dead",
+            ProcessState::Unknown(_) => "Unknown",
+        }
+    }
+
+    /// Check if this is a problematic state (zombie, disk wait)
+    pub fn is_problematic(&self) -> bool {
+        matches!(self, ProcessState::Zombie | ProcessState::DiskSleep)
     }
 }

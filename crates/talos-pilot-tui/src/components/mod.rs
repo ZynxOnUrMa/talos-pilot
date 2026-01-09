@@ -7,12 +7,14 @@ pub mod etcd;
 pub mod home;
 pub mod logs;
 pub mod multi_logs;
+pub mod processes;
 
 pub use cluster::ClusterComponent;
 pub use etcd::EtcdComponent;
 pub use home::HomeComponent;
 pub use logs::LogsComponent;
 pub use multi_logs::MultiLogsComponent;
+pub use processes::ProcessesComponent;
 
 use crate::action::Action;
 use color_eyre::Result;

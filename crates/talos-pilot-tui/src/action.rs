@@ -29,6 +29,8 @@ pub enum Action {
     ShowMultiLogs(String, String, Vec<String>),
     /// Show etcd cluster status
     ShowEtcd,
+    /// Show processes for a node: (hostname, address)
+    ShowProcesses(String, String),
 
     // UI state
     Tick,
