@@ -60,6 +60,9 @@ impl QuorumState {
     }
 }
 
+/// Default auto-refresh interval in seconds
+const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
+
 /// Etcd cluster status component
 pub struct EtcdComponent {
     /// Combined member data
@@ -82,9 +85,13 @@ pub struct EtcdComponent {
     loading: bool,
     /// Error message
     error: Option<String>,
+    /// Retry count for error recovery
+    retry_count: u32,
 
     /// Last refresh time
     last_refresh: Option<Instant>,
+    /// Auto-refresh enabled
+    auto_refresh: bool,
 
     /// Client for API calls
     client: Option<TalosClient>,
@@ -111,7 +118,9 @@ impl EtcdComponent {
             table_state,
             loading: true,
             error: None,
+            retry_count: 0,
             last_refresh: None,
+            auto_refresh: true,
             client: None,
         }
     }
@@ -130,31 +139,53 @@ impl EtcdComponent {
     /// Refresh etcd data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = &self.client else {
-            self.error = Some("No client configured".to_string());
+            self.set_error("No client configured".to_string());
             return Ok(());
         };
 
         self.loading = true;
-        self.error = None;
 
-        // Fetch member list, status, and alarms in parallel
-        let (members_result, status_result, alarms_result) = tokio::join!(
-            client.etcd_members(),
-            client.etcd_status(),
-            client.etcd_alarms()
-        );
+        // Fetch member list, status, and alarms in parallel with timeout
+        let timeout = std::time::Duration::from_secs(10);
+        let fetch_result = tokio::time::timeout(
+            timeout,
+            async {
+                tokio::join!(
+                    client.etcd_members(),
+                    client.etcd_status(),
+                    client.etcd_alarms()
+                )
+            }
+        ).await;
 
-        // Process member list
-        let member_infos = match members_result {
-            Ok(members) => members,
-            Err(e) => {
-                self.error = Some(format!("Failed to fetch members: {}", e));
-                self.loading = false;
+        let (members_result, status_result, alarms_result) = match fetch_result {
+            Ok(results) => results,
+            Err(_) => {
+                self.retry_count += 1;
+                self.set_error(format!(
+                    "Request timed out after {}s (retry {})",
+                    timeout.as_secs(),
+                    self.retry_count
+                ));
                 return Ok(());
             }
         };
 
-        // Process status
+        // Process member list - this is critical, fail if we can't get it
+        let member_infos = match members_result {
+            Ok(members) => {
+                self.error = None; // Clear error on partial success
+                members
+            }
+            Err(e) => {
+                self.retry_count += 1;
+                let msg = Self::format_error(&e);
+                self.set_error(format!("Failed to fetch members: {} (retry {})", msg, self.retry_count));
+                return Ok(());
+            }
+        };
+
+        // Process status - non-critical, just log warning
         let statuses = match status_result {
             Ok(s) => s,
             Err(e) => {
@@ -163,7 +194,7 @@ impl EtcdComponent {
             }
         };
 
-        // Process alarms
+        // Process alarms - non-critical
         self.alarms = match alarms_result {
             Ok(a) => a,
             Err(e) => {
@@ -180,6 +211,10 @@ impl EtcdComponent {
                 EtcdMember { info, status }
             })
             .collect();
+
+        // Success - reset retry count and clear error
+        self.retry_count = 0;
+        self.error = None;
 
         tracing::info!("Loaded {} etcd members", self.members.len());
 
@@ -253,6 +288,60 @@ impl EtcdComponent {
         if !self.members.is_empty() {
             self.selected = (self.selected + 1).min(self.members.len() - 1);
             self.table_state.select(Some(self.selected));
+        }
+    }
+
+    /// Format error messages for user-friendly display
+    fn format_error(error: &talos_rs::TalosError) -> String {
+        match error {
+            talos_rs::TalosError::Connection(msg) => {
+                if msg.contains("certificate") || msg.contains("tls") || msg.contains("ssl") {
+                    "TLS/certificate error - check talosconfig credentials".to_string()
+                } else if msg.contains("refused") {
+                    "Connection refused - is the node reachable?".to_string()
+                } else if msg.contains("timeout") {
+                    "Connection timed out - node may be slow or unreachable".to_string()
+                } else {
+                    format!("Connection failed: {}", msg)
+                }
+            }
+            talos_rs::TalosError::Grpc(status) => {
+                let msg = status.message().to_lowercase();
+                if msg.contains("unavailable") {
+                    "Service unavailable - node may be down".to_string()
+                } else if msg.contains("permission denied") {
+                    "Permission denied - check RBAC/credentials".to_string()
+                } else if msg.contains("unauthenticated") {
+                    "Authentication failed - check talosconfig".to_string()
+                } else if msg.contains("deadline exceeded") || msg.contains("timeout") {
+                    "Request timed out".to_string()
+                } else {
+                    format!("gRPC error: {}", status.message())
+                }
+            }
+            talos_rs::TalosError::Transport(e) => {
+                let msg = e.to_string();
+                if msg.contains("refused") {
+                    "Connection refused - is the node reachable?".to_string()
+                } else if msg.contains("timeout") || msg.contains("timed out") {
+                    "Connection timed out".to_string()
+                } else {
+                    format!("Transport error: {}", msg)
+                }
+            }
+            talos_rs::TalosError::Tls(msg) => {
+                format!("TLS error: {} - check talosconfig credentials", msg)
+            }
+            talos_rs::TalosError::ConfigNotFound(path) => {
+                format!("Config not found: {}", path)
+            }
+            talos_rs::TalosError::ConfigInvalid(msg) => {
+                format!("Invalid config: {}", msg)
+            }
+            talos_rs::TalosError::ContextNotFound(ctx) => {
+                format!("Context '{}' not found in talosconfig", ctx)
+            }
+            _ => error.to_string(),
         }
     }
 
@@ -502,6 +591,12 @@ impl EtcdComponent {
 
     /// Draw the footer with keybindings
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        let auto_status = if self.auto_refresh {
+            Span::styled("ON ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("OFF", Style::default().fg(Color::DarkGray))
+        };
+
         let line = Line::from(vec![
             Span::styled("[j/k]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" select  "),
@@ -511,6 +606,10 @@ impl EtcdComponent {
             Span::raw(" member logs  "),
             Span::styled("[r]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" refresh  "),
+            Span::styled("[a]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" auto:"),
+            auto_status,
+            Span::raw("  "),
             Span::styled("[q]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" back"),
         ]);
@@ -533,6 +632,11 @@ impl Component for EtcdComponent {
                 Ok(None)
             }
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
+            KeyCode::Char('a') => {
+                // Toggle auto-refresh
+                self.auto_refresh = !self.auto_refresh;
+                Ok(None)
+            }
             KeyCode::Char('l') => {
                 // View etcd logs for all control plane nodes
                 // Collect all member hostnames and show etcd logs for each
@@ -567,7 +671,18 @@ impl Component for EtcdComponent {
         }
     }
 
-    fn update(&mut self, _action: Action) -> Result<Option<Action>> {
+    fn update(&mut self, action: Action) -> Result<Option<Action>> {
+        if let Action::Tick = action {
+            // Check for auto-refresh
+            if self.auto_refresh && !self.loading {
+                if let Some(last) = self.last_refresh {
+                    let interval = std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
+                    if last.elapsed() >= interval {
+                        return Ok(Some(Action::Refresh));
+                    }
+                }
+            }
+        }
         Ok(None)
     }
 
