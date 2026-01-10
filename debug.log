@@ -1,0 +1,41 @@
+warning: methods `scroll_up`, `scroll_down`, `scroll_half_page_up`, and `scroll_half_page_down` are never used
+   --> crates/talos-pilot-tui/src/components/multi_logs.rs:953:8
+    |
+223 | impl MultiLogsComponent {
+    | ----------------------- methods in this implementation
+...
+953 |     fn scroll_up(&mut self, amount: u16) {
+    |        ^^^^^^^^^
+...
+959 |     fn scroll_down(&mut self, amount: u16) {
+    |        ^^^^^^^^^^^
+...
+968 |     fn scroll_half_page_up(&mut self) {
+    |        ^^^^^^^^^^^^^^^^^^^
+...
+974 |     fn scroll_half_page_down(&mut self) {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `get_service_for_conn` is never used
+   --> crates/talos-pilot-tui/src/components/network.rs:543:8
+    |
+166 | impl NetworkStatsComponent {
+    | -------------------------- method in this implementation
+...
+543 |     fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, Option<&ServiceInfo>)> {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `get_cpu_percent` is never used
+   --> crates/talos-pilot-tui/src/components/processes.rs:343:8
+    |
+152 | impl ProcessesComponent {
+    | ----------------------- method in this implementation
+...
+343 |     fn get_cpu_percent(&self, pid: i32) -> Option<f32> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: `talos-pilot-tui` (lib) generated 3 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/talos-pilot`

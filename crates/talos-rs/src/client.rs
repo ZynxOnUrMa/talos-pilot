@@ -656,6 +656,63 @@ impl TalosClient {
         Ok(output)
     }
 
+    /// Read a file from the node's filesystem
+    ///
+    /// Returns the file contents as a string, or an error if the file doesn't exist
+    /// or cannot be read.
+    pub async fn read_file(&self, path: &str) -> Result<String, TalosError> {
+        use crate::proto::machine::ReadRequest;
+
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(ReadRequest {
+            path: path.to_string(),
+        }));
+
+        let response = client.read(request).await?;
+        let mut stream = response.into_inner();
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => {
+                    // Check for errors in the metadata
+                    if let Some(metadata) = &data.metadata {
+                        if !metadata.error.is_empty() {
+                            return Err(TalosError::Connection(metadata.error.clone()));
+                        }
+                    }
+                    if let Ok(text) = String::from_utf8(data.bytes) {
+                        output.push_str(&text);
+                    }
+                }
+                Err(e) => {
+                    // If we get an error (like file not found), return it
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Check if the br_netfilter kernel module is loaded
+    ///
+    /// Returns true if the module is loaded, false otherwise.
+    /// This checks by reading /proc/sys/net/bridge/bridge-nf-call-iptables
+    /// which only exists when br_netfilter is loaded.
+    pub async fn is_br_netfilter_loaded(&self) -> Result<bool, TalosError> {
+        match self.read_file("/proc/sys/net/bridge/bridge-nf-call-iptables").await {
+            Ok(content) => {
+                tracing::info!("br_netfilter sysctl file exists, content: {:?}", content.trim());
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::info!("br_netfilter sysctl file not found: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
     /// Apply a configuration patch to the node
     ///
     /// # Arguments

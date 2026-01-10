@@ -465,12 +465,12 @@ impl DiagnosticsComponent {
 
         let result = tokio::time::timeout(timeout, async {
             // Fetch data in parallel
-            let (memory_result, load_result, services_result, dmesg_result, logs_result) = tokio::join!(
+            let (memory_result, load_result, services_result, logs_result, br_netfilter_result) = tokio::join!(
                 client.memory(),
                 client.load_avg(),
                 client.services(),
-                client.dmesg(false, true),
                 client.logs("kubelet", 500),
+                client.is_br_netfilter_loaded(),
             );
 
             // Process results into checks
@@ -532,33 +532,35 @@ impl DiagnosticsComponent {
                 }
             }
 
-            // Kernel modules check (from dmesg)
-            match dmesg_result {
-                Ok(dmesg) => {
-                    let br_netfilter_missing = dmesg.contains("bridge-nf-call-iptables: no such file")
-                        || dmesg.contains("br_netfilter");
+            // Kernel modules check - directly check if br_netfilter is loaded
+            // by reading /proc/sys/net/bridge/bridge-nf-call-iptables
+            let br_netfilter_missing = match &br_netfilter_result {
+                Ok(loaded) => {
+                    tracing::info!("br_netfilter check: loaded = {}", loaded);
+                    !loaded
+                }
+                Err(e) => {
+                    tracing::info!("br_netfilter check error: {}", e);
+                    true // If we can't check, assume it's missing
+                }
+            };
 
-                    if br_netfilter_missing && dmesg.contains("no such file") {
-                        system_checks.push(DiagnosticCheck::fail(
-                            "kernel_modules",
-                            "Kernel Modules",
-                            "br_netfilter missing",
-                            Some(DiagnosticFix {
-                                description: "Add br_netfilter kernel module".to_string(),
-                                action: FixAction::AddKernelModule("br_netfilter".to_string()),
-                            }),
-                        ).with_details("The br_netfilter kernel module is required for Kubernetes networking. Without it, CNI plugins like Flannel cannot function properly."));
-                    } else {
-                        system_checks.push(DiagnosticCheck::pass(
-                            "kernel_modules",
-                            "Kernel Modules",
-                            "OK",
-                        ));
-                    }
-                }
-                Err(_) => {
-                    system_checks.push(DiagnosticCheck::unknown("kernel_modules", "Kernel Modules"));
-                }
+            if br_netfilter_missing {
+                system_checks.push(DiagnosticCheck::fail(
+                    "kernel_modules",
+                    "Kernel Modules",
+                    "br_netfilter missing",
+                    Some(DiagnosticFix {
+                        description: "Add br_netfilter kernel module".to_string(),
+                        action: FixAction::AddKernelModule("br_netfilter".to_string()),
+                    }),
+                ).with_details("The br_netfilter kernel module is required for Kubernetes networking. Without it, CNI plugins like Flannel cannot function properly."));
+            } else {
+                system_checks.push(DiagnosticCheck::pass(
+                    "kernel_modules",
+                    "Kernel Modules",
+                    "OK",
+                ));
             }
 
             // Service checks
@@ -615,12 +617,28 @@ impl DiagnosticsComponent {
                     let crashloop = logs.contains("CrashLoopBackOff");
 
                     if cni_failed {
+                        // If br_netfilter is missing, that's likely the root cause - offer the fix
+                        let fix = if br_netfilter_missing {
+                            Some(DiagnosticFix {
+                                description: "Add br_netfilter kernel module".to_string(),
+                                action: FixAction::AddKernelModule("br_netfilter".to_string()),
+                            })
+                        } else {
+                            None
+                        };
+
+                        let details = if br_netfilter_missing {
+                            "CNI plugin failed because br_netfilter kernel module is missing. Apply the fix to add the module and reboot the node."
+                        } else {
+                            "CNI plugin failed to set up pod networking. Check the kernel modules and flannel pod logs."
+                        };
+
                         kubernetes_checks.push(DiagnosticCheck::fail(
                             "cni",
                             "CNI (Flannel)",
-                            "Network setup failed",
-                            None, // Fix depends on root cause (kernel module, flannel crash, etc.)
-                        ).with_details("CNI plugin failed to set up pod networking. Check the kernel modules and flannel pod logs."));
+                            if br_netfilter_missing { "br_netfilter missing" } else { "Network setup failed" },
+                            fix,
+                        ).with_details(details));
                     } else {
                         kubernetes_checks.push(DiagnosticCheck::pass("cni", "CNI", "OK"));
                     }
