@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Frame,
 };
 use std::collections::HashMap;
@@ -70,6 +70,13 @@ pub enum ConnSortBy {
     #[default]
     State,  // Sort by connection state
     Port,   // Sort by local port
+}
+
+/// Pending action requiring confirmation
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    /// Restart a service (service_id, service_name)
+    RestartService(String, String),
 }
 
 /// Network stats component for viewing node network interfaces
@@ -139,6 +146,13 @@ pub struct NetworkStatsComponent {
     /// Viewport height for connection table (for page navigation)
     conn_viewport_height: u16,
 
+    /// Pending action requiring confirmation
+    pending_action: Option<PendingAction>,
+    /// Status message to show (e.g., "Service restarted successfully")
+    status_message: Option<(String, Instant)>,
+    /// Service ID pending restart (to be executed in update)
+    pending_restart_service: Option<String>,
+
     /// Client for API calls
     client: Option<TalosClient>,
 }
@@ -185,6 +199,9 @@ impl NetworkStatsComponent {
             listening_only: false,
             conn_selection_start: None,
             conn_viewport_height: 20, // Will be updated on draw
+            pending_action: None,
+            status_message: None,
+            pending_restart_service: None,
             client: None,
         }
     }
@@ -1347,7 +1364,7 @@ impl NetworkStatsComponent {
                 Span::raw(", "),
                 Span::styled(health_text, Style::default().fg(health_color)),
                 Span::raw(")   "),
-                Span::styled("[l]", Style::default().fg(Color::Cyan)),
+                Span::styled("[o]", Style::default().fg(Color::Cyan)),
                 Span::styled(" logs  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[R]", Style::default().fg(Color::Cyan)),
                 Span::styled(" restart", Style::default().fg(Color::DarkGray)),
@@ -1544,7 +1561,106 @@ impl NetworkStatsComponent {
             // Refresh
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
 
+            // Open service logs (for known service ports)
+            KeyCode::Char('o') => {
+                self.open_service_logs()
+            }
+
+            // Restart service (for known service ports) - requires confirmation
+            KeyCode::Char('R') => {
+                self.initiate_service_restart();
+                Ok(None)
+            }
+
             _ => Ok(None),
+        }
+    }
+
+    /// Handle key events when a confirmation is pending
+    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Confirmed - execute the action
+                if let Some(action) = self.pending_action.take() {
+                    return self.execute_pending_action(action);
+                }
+                Ok(None)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                // Cancelled
+                self.pending_action = None;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Open logs for the currently selected connection's service
+    fn open_service_logs(&self) -> Result<Option<Action>> {
+        let conns = self.filtered_connections();
+        let Some(conn) = conns.get(self.conn_selected) else {
+            return Ok(None);
+        };
+
+        // Only for known service ports
+        let Some(service_name) = port_to_service(conn.local_port) else {
+            return Ok(None);
+        };
+
+        // Return action to show logs for this service
+        Ok(Some(Action::ShowMultiLogs(
+            self.address.clone(),
+            "".to_string(), // role not needed for single service
+            vec![service_name.to_string()],
+        )))
+    }
+
+    /// Initiate service restart - sets pending_action for confirmation
+    fn initiate_service_restart(&mut self) {
+        let conns = self.filtered_connections();
+        let Some(conn) = conns.get(self.conn_selected) else {
+            return;
+        };
+
+        // Only for known service ports
+        let Some(service_name) = port_to_service(conn.local_port) else {
+            return;
+        };
+
+        // Check if service exists
+        if !self.services.contains_key(service_name) {
+            self.status_message = Some((
+                format!("Service '{}' not found", service_name),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        // Set pending action - will require confirmation
+        self.pending_action = Some(PendingAction::RestartService(
+            service_name.to_string(),
+            service_name.to_string(),
+        ));
+    }
+
+    /// Execute a pending action after confirmation
+    fn execute_pending_action(&mut self, action: PendingAction) -> Result<Option<Action>> {
+        match action {
+            PendingAction::RestartService(service_id, service_name) => {
+                // We need to restart the service async, so we'll return an action
+                // that the app can handle. For now, show a status message.
+                // The actual restart will be handled via the refresh mechanism.
+                self.status_message = Some((
+                    format!("Restarting {}...", service_name),
+                    Instant::now(),
+                ));
+
+                // Spawn the restart in the background
+                // Note: We can't easily do async here, so we'll store that we need to restart
+                // and handle it in the update method
+                self.pending_restart_service = Some(service_id);
+                Ok(None)
+            }
         }
     }
 
@@ -1613,6 +1729,11 @@ impl NetworkStatsComponent {
 
 impl Component for NetworkStatsComponent {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        // If there's a pending confirmation, handle that first
+        if self.pending_action.is_some() {
+            return self.handle_confirmation_key(key);
+        }
+
         match self.view_mode {
             ViewMode::Interfaces => self.handle_interfaces_key(key),
             ViewMode::Connections => self.handle_connections_key(key),
@@ -1621,6 +1742,13 @@ impl Component for NetworkStatsComponent {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         if let Action::Tick = action {
+            // Clear old status messages (after 3 seconds)
+            if let Some((_, time)) = &self.status_message {
+                if time.elapsed() > std::time::Duration::from_secs(3) {
+                    self.status_message = None;
+                }
+            }
+
             // Check for auto-refresh
             if self.auto_refresh && !self.loading {
                 if let Some(last) = self.last_refresh {
@@ -1654,6 +1782,144 @@ impl Component for NetworkStatsComponent {
             ViewMode::Connections => self.draw_connections_view(frame, area),
         }
 
+        // Draw confirmation dialog overlay if pending
+        if let Some(ref action) = self.pending_action {
+            self.draw_confirmation_dialog(frame, area, action);
+        }
+
+        // Draw status message overlay if present
+        if let Some((ref msg, _)) = self.status_message {
+            self.draw_status_message(frame, area, msg);
+        }
+
         Ok(())
+    }
+}
+
+// Service action methods
+impl NetworkStatsComponent {
+    /// Perform the service restart (called from app.rs after refresh)
+    pub async fn perform_pending_restart(&mut self) -> Result<Option<String>> {
+        let Some(service_id) = self.pending_restart_service.take() else {
+            return Ok(None);
+        };
+
+        let Some(client) = &self.client else {
+            self.status_message = Some(("No client configured".to_string(), Instant::now()));
+            return Ok(None);
+        };
+
+        match client.service_restart(&service_id).await {
+            Ok(results) => {
+                let msg = if let Some(result) = results.first() {
+                    if result.response.is_empty() {
+                        format!("Service '{}' restarted successfully", service_id)
+                    } else {
+                        format!("Service '{}': {}", service_id, result.response)
+                    }
+                } else {
+                    format!("Service '{}' restart requested", service_id)
+                };
+                self.status_message = Some((msg.clone(), Instant::now()));
+                Ok(Some(msg))
+            }
+            Err(e) => {
+                let msg = format!("Failed to restart '{}': {}", service_id, e);
+                self.status_message = Some((msg.clone(), Instant::now()));
+                Ok(Some(msg))
+            }
+        }
+    }
+
+    /// Check if there's a pending restart
+    pub fn has_pending_restart(&self) -> bool {
+        self.pending_restart_service.is_some()
+    }
+
+    /// Draw the confirmation dialog
+    fn draw_confirmation_dialog(&self, frame: &mut Frame, area: Rect, action: &PendingAction) {
+        let (title, message) = match action {
+            PendingAction::RestartService(_, name) => (
+                "Confirm Restart",
+                format!("Restart service '{}'?", name),
+            ),
+        };
+
+        // Center the dialog
+        let dialog_width = 40u16;
+        let dialog_height = 5u16;
+        let x = area.x + (area.width.saturating_sub(dialog_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(dialog_height)) / 2;
+        let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+
+        // Clear the area first (removes any text underneath)
+        frame.render_widget(Clear, dialog_area);
+
+        // Draw the dialog block with background
+        let block = Block::default()
+            .title(Span::styled(
+                format!(" {} ", title),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(Color::Black));
+
+        let inner = block.inner(dialog_area);
+
+        let text = vec![
+            Line::from(message),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[y]", Style::default().fg(Color::Green)),
+                Span::raw(" Yes  "),
+                Span::styled("[n/Esc]", Style::default().fg(Color::Red)),
+                Span::raw(" No"),
+            ]),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().bg(Color::Black));
+
+        frame.render_widget(block, dialog_area);
+        frame.render_widget(paragraph, inner);
+    }
+
+    /// Draw the status message as a floating notification
+    fn draw_status_message(&self, frame: &mut Frame, area: Rect, message: &str) {
+        // Determine the color based on message content
+        let (fg_color, border_color) = if message.contains("Failed") || message.contains("Error") {
+            (Color::White, Color::Red)
+        } else if message.contains("successfully") {
+            (Color::White, Color::Green)
+        } else {
+            (Color::Black, Color::Yellow)
+        };
+
+        // Create a floating notification centered near the top
+        let msg_width = (message.len() as u16 + 4).min(area.width.saturating_sub(4));
+        let msg_height = 3u16;
+        let x = area.x + (area.width.saturating_sub(msg_width)) / 2;
+        let y = area.y + 2; // Near the top, below header
+        let msg_area = Rect::new(x, y, msg_width, msg_height);
+
+        // Clear the area first
+        frame.render_widget(Clear, msg_area);
+
+        // Draw the notification box
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(border_color));
+
+        let inner = block.inner(msg_area);
+
+        let status = Paragraph::new(message)
+            .style(Style::default().fg(fg_color).add_modifier(Modifier::BOLD))
+            .alignment(ratatui::layout::Alignment::Center);
+
+        frame.render_widget(block, msg_area);
+        frame.render_widget(status, inner);
     }
 }

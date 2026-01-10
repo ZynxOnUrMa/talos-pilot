@@ -139,6 +139,32 @@ impl TalosClient {
         Ok(services)
     }
 
+    /// Restart a service on all configured nodes
+    ///
+    /// Returns the response message from each node.
+    pub async fn service_restart(&self, service_id: &str) -> Result<Vec<ServiceRestartResult>, TalosError> {
+        use crate::proto::machine::ServiceRestartRequest;
+
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(ServiceRestartRequest {
+            id: service_id.to_string(),
+        }));
+
+        let response = client.service_restart(request).await?;
+        let inner = response.into_inner();
+
+        let results: Vec<ServiceRestartResult> = inner
+            .messages
+            .into_iter()
+            .map(|msg| ServiceRestartResult {
+                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                response: msg.resp,
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Get memory information from all configured nodes
     pub async fn memory(&self) -> Result<Vec<NodeMemory>, TalosError> {
         let mut client = self.machine_client();
@@ -632,6 +658,13 @@ pub struct ServiceHealth {
     pub unknown: bool,
     pub healthy: bool,
     pub last_message: String,
+}
+
+/// Result of a service restart operation
+#[derive(Debug, Clone)]
+pub struct ServiceRestartResult {
+    pub node: String,
+    pub response: String,
 }
 
 /// Memory information for a node

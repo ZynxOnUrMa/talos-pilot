@@ -536,7 +536,15 @@ impl MultiLogsComponent {
                             let rest_start = space_pos + 2 + time_end;
                             let rest = line[rest_start..].trim();
                             let short_ts = Self::extract_time_part(time_part);
-                            let sort_key = Self::time_to_sort_key(&short_ts);
+                            // Parse MMDD and time, convert to Unix timestamp
+                            // Use current year since klog doesn't include year
+                            let month: i64 = date_part[0..2].parse().unwrap_or(1);
+                            let day: i64 = date_part[2..4].parse().unwrap_or(1);
+                            let hour: i64 = short_ts.get(0..2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let min: i64 = short_ts.get(3..5).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let sec: i64 = short_ts.get(6..8).and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let year = Self::current_year();
+                            let sort_key = Self::datetime_to_unix(year, month, day, hour, min, sec);
                             return (short_ts, sort_key, rest);
                         }
                     }
@@ -564,7 +572,8 @@ impl MultiLogsComponent {
                     {
                         let ts = &stripped[..end_quote];
                         let short_ts = Self::extract_time_part(ts);
-                        let sort_key = Self::time_to_sort_key(&short_ts);
+                        // Pass the full timestamp for sorting to preserve date
+                        let sort_key = Self::time_to_sort_key(ts);
                         return (short_ts, sort_key, line);
                     }
                 }
@@ -575,7 +584,8 @@ impl MultiLogsComponent {
                 if let Some(ts_end) = line[ts_value_start..].find('"') {
                     let ts = &line[ts_value_start..ts_value_start + ts_end];
                     let short_ts = Self::extract_time_part(ts);
-                    let sort_key = Self::time_to_sort_key(&short_ts);
+                    // Pass the full timestamp for sorting to preserve date
+                    let sort_key = Self::time_to_sort_key(ts);
                     return (short_ts, sort_key, line);
                 }
             }
@@ -587,7 +597,8 @@ impl MultiLogsComponent {
             if let Some(ts_end) = line[ts_value_start..].find('"') {
                 let ts = &line[ts_value_start..ts_value_start + ts_end];
                 let short_ts = Self::extract_time_part(ts);
-                let sort_key = Self::time_to_sort_key(&short_ts);
+                // Pass the full timestamp for sorting to preserve date
+                let sort_key = Self::time_to_sort_key(ts);
                 return (short_ts, sort_key, line);
             }
         }
@@ -627,7 +638,8 @@ impl MultiLogsComponent {
             if short_ts == "00:00:00" {
                 return (String::new(), 0, line);
             }
-            let sort_key = Self::time_to_sort_key(&short_ts);
+            // Pass the full timestamp for sorting to preserve date
+            let sort_key = Self::time_to_sort_key(ts);
             (short_ts, sort_key, rest)
         } else {
             // No timestamp found - don't search the whole line as that matches
@@ -694,15 +706,99 @@ impl MultiLogsComponent {
         String::new()
     }
 
-    /// Convert HH:MM:SS to sortable integer (HHMMSS)
-    fn time_to_sort_key(time: &str) -> i64 {
-        // Extract just digits from HH:MM:SS or HH:MM format
-        let digits: String = time.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
+    /// Convert a full timestamp string to a Unix timestamp (seconds since epoch)
+    /// Handles ISO 8601 (2026-01-09T23:23:45), slash format (2026/01/09 23:23:45),
+    /// and falls back to time-only (HHMMSS) if no date found
+    fn time_to_sort_key(ts: &str) -> i64 {
+        let bytes = ts.as_bytes();
+        let len = bytes.len();
+
+        // Look for date patterns: YYYY-MM-DD or YYYY/MM/DD
+        if len >= 10 && (bytes[4] == b'-' || bytes[4] == b'/') {
+            // Try to parse: YYYY-MM-DDTHH:MM:SS or YYYY/MM/DD HH:MM:SS
+            let year: i64 = ts[0..4].parse().unwrap_or(0);
+            let month: i64 = ts[5..7].parse().unwrap_or(0);
+            let day: i64 = ts[8..10].parse().unwrap_or(0);
+
+            // Look for time part after date
+            let mut hour: i64 = 0;
+            let mut min: i64 = 0;
+            let mut sec: i64 = 0;
+
+            // Time starts at position 11 (after 'T' or ' ')
+            if len >= 19 {
+                hour = ts[11..13].parse().unwrap_or(0);
+                min = ts[14..16].parse().unwrap_or(0);
+                sec = ts[17..19].parse().unwrap_or(0);
+            }
+
+            if year > 0 && month > 0 && day > 0 {
+                // Convert to Unix timestamp (seconds since 1970-01-01)
+                return Self::datetime_to_unix(year, month, day, hour, min, sec);
+            }
+        }
+
+        // Fallback: extract just time digits from HH:MM:SS or HH:MM format
+        // This won't sort correctly across days, but it's the best we can do
+        let digits: String = ts.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
         digits.parse().unwrap_or(0)
+    }
+
+    /// Convert date/time components to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+    fn datetime_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
+        // Days from year 1970 to start of given year
+        let mut days: i64 = 0;
+        for y in 1970..year {
+            days += if Self::is_leap_year(y) { 366 } else { 365 };
+        }
+
+        // Days from start of year to start of month
+        let days_in_months = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for m in 1..month {
+            days += days_in_months[m as usize] as i64;
+            if m == 2 && Self::is_leap_year(year) {
+                days += 1;
+            }
+        }
+
+        // Add days in current month (day is 1-indexed)
+        days += day - 1;
+
+        // Convert to seconds and add time
+        days * 86400 + hour * 3600 + min * 60 + sec
+    }
+
+    /// Check if a year is a leap year
+    fn is_leap_year(year: i64) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    }
+
+    /// Get the current year from system time
+    fn current_year() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+
+        // Calculate year from Unix timestamp
+        let mut year = 1970;
+        let mut remaining_secs = secs;
+        loop {
+            let days_in_year = if Self::is_leap_year(year) { 366 } else { 365 };
+            let secs_in_year = days_in_year * 86400;
+            if remaining_secs < secs_in_year {
+                break;
+            }
+            remaining_secs -= secs_in_year;
+            year += 1;
+        }
+        year
     }
 
     /// Convert Unix timestamp to (HH:MM:SS, sort_key)
     /// Auto-detects whether timestamp is in seconds or milliseconds
+    /// Sort key uses the full Unix timestamp to preserve date ordering
     fn unix_ts_to_time(ts: f64) -> (String, i64) {
         // Auto-detect: timestamps < 10^12 are likely seconds, >= 10^12 are milliseconds
         // Current Unix time in seconds is ~1.7 billion (2024), in ms it's ~1.7 trillion
@@ -719,7 +815,8 @@ impl MultiLogsComponent {
         let minutes = (secs_in_day % 3600) / 60;
         let seconds = secs_in_day % 60;
         let short_ts = format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
-        let sort_key = hours * 10000 + minutes * 100 + seconds;
+        // Use the full Unix timestamp as the sort key to preserve date ordering
+        let sort_key = ts_secs;
         (short_ts, sort_key)
     }
 
