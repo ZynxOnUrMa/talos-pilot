@@ -517,6 +517,36 @@ impl TalosClient {
 
         Ok(result)
     }
+
+    /// Get network device statistics from all configured nodes
+    pub async fn network_device_stats(&self) -> Result<Vec<NodeNetworkStats>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.network_device_stats(request).await?;
+        let inner = response.into_inner();
+
+        let mut result = Vec::new();
+        for msg in inner.messages {
+            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+
+            let total = msg.total.map(|t| NetDevStats::from_proto(&t));
+
+            let devices: Vec<NetDevStats> = msg
+                .devices
+                .iter()
+                .map(NetDevStats::from_proto)
+                .collect();
+
+            result.push(NodeNetworkStats {
+                hostname,
+                total,
+                devices,
+            });
+        }
+
+        Ok(result)
+    }
 }
 
 /// Version information for a node
@@ -924,5 +954,180 @@ impl ProcessState {
     /// Check if this is a problematic state (zombie, disk wait)
     pub fn is_problematic(&self) -> bool {
         matches!(self, ProcessState::Zombie | ProcessState::DiskSleep)
+    }
+}
+
+// ==================== Network Types ====================
+
+/// Network device statistics for a node
+#[derive(Debug, Clone)]
+pub struct NodeNetworkStats {
+    /// Node hostname
+    pub hostname: String,
+    /// Aggregate totals across all devices
+    pub total: Option<NetDevStats>,
+    /// Per-device statistics
+    pub devices: Vec<NetDevStats>,
+}
+
+/// Statistics for a single network device
+#[derive(Debug, Clone)]
+pub struct NetDevStats {
+    /// Device name (e.g., "eth0", "cni0")
+    pub name: String,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Packets received
+    pub rx_packets: u64,
+    /// Receive errors
+    pub rx_errors: u64,
+    /// Receive dropped
+    pub rx_dropped: u64,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+    /// Packets transmitted
+    pub tx_packets: u64,
+    /// Transmit errors
+    pub tx_errors: u64,
+    /// Transmit dropped
+    pub tx_dropped: u64,
+}
+
+impl NetDevStats {
+    /// Create from protobuf NetDev
+    fn from_proto(dev: &crate::proto::machine::NetDev) -> Self {
+        Self {
+            name: dev.name.clone(),
+            rx_bytes: dev.rx_bytes,
+            rx_packets: dev.rx_packets,
+            rx_errors: dev.rx_errors,
+            rx_dropped: dev.rx_dropped,
+            tx_bytes: dev.tx_bytes,
+            tx_packets: dev.tx_packets,
+            tx_errors: dev.tx_errors,
+            tx_dropped: dev.tx_dropped,
+        }
+    }
+
+    /// Check if device has any errors or dropped packets
+    pub fn has_errors(&self) -> bool {
+        self.rx_errors > 0 || self.tx_errors > 0 || self.rx_dropped > 0 || self.tx_dropped > 0
+    }
+
+    /// Get total errors (rx + tx)
+    pub fn total_errors(&self) -> u64 {
+        self.rx_errors + self.tx_errors
+    }
+
+    /// Get total dropped (rx + tx)
+    pub fn total_dropped(&self) -> u64 {
+        self.rx_dropped + self.tx_dropped
+    }
+
+    /// Get total traffic (rx + tx bytes)
+    pub fn total_traffic(&self) -> u64 {
+        self.rx_bytes + self.tx_bytes
+    }
+
+    /// Format bytes as human-readable (KB, MB, GB, TB)
+    pub fn format_bytes(bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        const TB: u64 = GB * 1024;
+
+        if bytes >= TB {
+            format!("{:.1} TB", bytes as f64 / TB as f64)
+        } else if bytes >= GB {
+            format!("{:.1} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.1} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.1} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    /// Format rate as human-readable (KB/s, MB/s, GB/s)
+    pub fn format_rate(bytes_per_sec: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+
+        if bytes_per_sec >= GB {
+            format!("{:.1} GB/s", bytes_per_sec as f64 / GB as f64)
+        } else if bytes_per_sec >= MB {
+            format!("{:.1} MB/s", bytes_per_sec as f64 / MB as f64)
+        } else if bytes_per_sec >= KB {
+            format!("{:.1} KB/s", bytes_per_sec as f64 / KB as f64)
+        } else {
+            format!("{} B/s", bytes_per_sec)
+        }
+    }
+}
+
+/// Calculated rate for a network device (from delta between samples)
+#[derive(Debug, Clone, Default)]
+pub struct NetDevRate {
+    /// Device name
+    pub name: String,
+    /// RX bytes per second
+    pub rx_bytes_per_sec: u64,
+    /// TX bytes per second
+    pub tx_bytes_per_sec: u64,
+    /// Current RX errors (cumulative)
+    pub rx_errors: u64,
+    /// Current TX errors (cumulative)
+    pub tx_errors: u64,
+    /// Current RX dropped (cumulative)
+    pub rx_dropped: u64,
+    /// Current TX dropped (cumulative)
+    pub tx_dropped: u64,
+}
+
+impl NetDevRate {
+    /// Calculate rate from previous and current samples
+    pub fn from_delta(prev: &NetDevStats, curr: &NetDevStats, elapsed_secs: f64) -> Self {
+        let rx_delta = curr.rx_bytes.saturating_sub(prev.rx_bytes);
+        let tx_delta = curr.tx_bytes.saturating_sub(prev.tx_bytes);
+
+        Self {
+            name: curr.name.clone(),
+            rx_bytes_per_sec: if elapsed_secs > 0.0 {
+                (rx_delta as f64 / elapsed_secs) as u64
+            } else {
+                0
+            },
+            tx_bytes_per_sec: if elapsed_secs > 0.0 {
+                (tx_delta as f64 / elapsed_secs) as u64
+            } else {
+                0
+            },
+            rx_errors: curr.rx_errors,
+            tx_errors: curr.tx_errors,
+            rx_dropped: curr.rx_dropped,
+            tx_dropped: curr.tx_dropped,
+        }
+    }
+
+    /// Check if device has any errors or dropped packets
+    pub fn has_errors(&self) -> bool {
+        self.rx_errors > 0 || self.tx_errors > 0 || self.rx_dropped > 0 || self.tx_dropped > 0
+    }
+
+    /// Get total rate (rx + tx)
+    pub fn total_rate(&self) -> u64 {
+        self.rx_bytes_per_sec + self.tx_bytes_per_sec
+    }
+
+    /// Get total errors
+    pub fn total_errors(&self) -> u64 {
+        self.rx_errors + self.tx_errors
+    }
+
+    /// Get total dropped
+    pub fn total_dropped(&self) -> u64 {
+        self.rx_dropped + self.tx_dropped
     }
 }

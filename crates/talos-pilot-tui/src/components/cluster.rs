@@ -445,6 +445,18 @@ impl Component for ClusterComponent {
                     Ok(None)
                 }
             }
+            KeyCode::Char('n') => {
+                // View network stats for current node
+                if let Some(node_name) = self.current_node_name() {
+                    // Look up the IP address for this node
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    tracing::info!("Cluster: pressing n, node_name='{}', ip='{}'", node_name, node_ip);
+                    Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    tracing::warn!("Cluster: pressing n, but no node selected");
+                    Ok(None)
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -546,6 +558,9 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::raw("[p]").fg(Color::Yellow),
             Span::raw(" procs").dim(),
+            Span::raw("  "),
+            Span::raw("[n]").fg(Color::Yellow),
+            Span::raw(" network").dim(),
         ]))
         .block(
             Block::default()

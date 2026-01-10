@@ -69,6 +69,8 @@ pub use client::{
     EtcdAlarm, EtcdAlarmType, EtcdMemberInfo, EtcdMemberStatus,
     // Process types
     NodeProcesses, ProcessInfo, ProcessState,
+    // Network types
+    NetDevRate, NetDevStats, NodeNetworkStats,
 };
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;

@@ -31,6 +31,8 @@ pub enum Action {
     ShowEtcd,
     /// Show processes for a node: (hostname, address)
     ShowProcesses(String, String),
+    /// Show network stats for a node: (hostname, address)
+    ShowNetwork(String, String),
 
     // UI state
     Tick,

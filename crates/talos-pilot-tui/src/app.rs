@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, EtcdComponent, MultiLogsComponent, ProcessesComponent};
+use crate::components::{ClusterComponent, Component, EtcdComponent, MultiLogsComponent, NetworkStatsComponent, ProcessesComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -15,6 +15,7 @@ enum View {
     MultiLogs,
     Etcd,
     Processes,
+    Network,
 }
 
 /// Main application state
@@ -31,6 +32,8 @@ pub struct App {
     etcd: Option<EtcdComponent>,
     /// Processes component (created when viewing processes)
     processes: Option<ProcessesComponent>,
+    /// Network stats component (created when viewing network)
+    network: Option<NetworkStatsComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -67,6 +70,7 @@ impl App {
             multi_logs: None,
             etcd: None,
             processes: None,
+            network: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -119,6 +123,11 @@ impl App {
                             let _ = processes.draw(frame, area);
                         }
                     }
+                    View::Network => {
+                        if let Some(network) = &mut self.network {
+                            let _ = network.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -145,6 +154,13 @@ impl App {
                             View::Processes => {
                                 if let Some(processes) = &mut self.processes {
                                     processes.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Network => {
+                                if let Some(network) = &mut self.network {
+                                    network.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -215,6 +231,9 @@ impl App {
                     View::Processes => {
                         self.processes = None;
                     }
+                    View::Network => {
+                        self.network = None;
+                    }
                     View::Cluster => {}
                 }
                 // Return to cluster view
@@ -249,6 +268,13 @@ impl App {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
                     }
+                    View::Network => {
+                        if let Some(network) = &mut self.network
+                            && let Some(next_action) = network.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
                 }
             }
             Action::Resize(_w, _h) => {
@@ -271,6 +297,13 @@ impl App {
                         if let Some(processes) = &mut self.processes {
                             if let Err(e) = processes.refresh().await {
                                 processes.set_error(e.to_string());
+                            }
+                        }
+                    }
+                    View::Network => {
+                        if let Some(network) = &mut self.network {
+                            if let Err(e) = network.refresh().await {
+                                network.set_error(e.to_string());
                             }
                         }
                     }
@@ -354,6 +387,28 @@ impl App {
                 self.processes = Some(processes);
                 self.view = View::Processes;
             }
+            Action::ShowNetwork(hostname, address) => {
+                // Switch to network stats view for a node
+                tracing::info!("ShowNetwork: hostname='{}', address='{}'", hostname, address);
+
+                // Create network component
+                let mut network = NetworkStatsComponent::new(hostname, address.clone());
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    // Create a client configured for this specific node
+                    let node_client = client.with_node(&address);
+                    tracing::info!("Created node client for network: '{}'", address);
+                    network.set_client(node_client);
+                    if let Err(e) = network.refresh().await {
+                        tracing::error!("Network refresh error: {:?}", e);
+                        network.set_error(e.to_string());
+                    }
+                }
+
+                self.network = Some(network);
+                self.view = View::Network;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -379,6 +434,13 @@ impl App {
                     View::Processes => {
                         if let Some(processes) = &mut self.processes
                             && let Some(next_action) = processes.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Network => {
+                        if let Some(network) = &mut self.network
+                            && let Some(next_action) = network.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

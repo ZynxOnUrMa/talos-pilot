@@ -7,6 +7,7 @@ pub mod etcd;
 pub mod home;
 pub mod logs;
 pub mod multi_logs;
+pub mod network;
 pub mod processes;
 
 pub use cluster::ClusterComponent;
@@ -14,6 +15,7 @@ pub use etcd::EtcdComponent;
 pub use home::HomeComponent;
 pub use logs::LogsComponent;
 pub use multi_logs::MultiLogsComponent;
+pub use network::NetworkStatsComponent;
 pub use processes::ProcessesComponent;
 
 use crate::action::Action;
