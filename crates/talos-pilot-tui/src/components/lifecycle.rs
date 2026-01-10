@@ -14,7 +14,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Instant;
-use talos_rs::{TalosClient, VersionInfo};
+use talos_rs::{NodeTimeInfo, TalosClient, VersionInfo};
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 30;
@@ -70,6 +70,9 @@ pub struct LifecycleComponent {
     /// Talos versions per node
     versions: Vec<VersionInfo>,
 
+    /// Time sync info per node
+    time_info: Vec<NodeTimeInfo>,
+
     /// Node statuses
     node_statuses: Vec<NodeStatus>,
 
@@ -112,6 +115,7 @@ impl LifecycleComponent {
         Self {
             context_name,
             versions: Vec::new(),
+            time_info: Vec::new(),
             node_statuses: Vec::new(),
             alerts: Vec::new(),
             selected: 0,
@@ -159,27 +163,46 @@ impl LifecycleComponent {
                     }
                 }
 
-                // Build node statuses from version info
-                self.node_statuses = versions
-                    .iter()
-                    .map(|v| NodeStatus {
-                        hostname: v.node.clone(),
-                        version: v.version.clone(),
-                        config_hash: None, // Needs MachineConfig API
-                        time_synced: None, // Needs TimeStatus API
-                        ready: true,       // Assume ready for now
-                        platform: v.platform.clone(),
-                    })
-                    .collect();
-
                 self.versions = versions;
-                self.generate_alerts();
             }
             Err(e) => {
                 self.error = Some(format!("Failed to fetch versions: {}", e));
             }
         }
 
+        // Fetch time sync status
+        match client.time().await {
+            Ok(times) => {
+                self.time_info = times;
+            }
+            Err(e) => {
+                // Time fetch failure is not fatal - just log it
+                tracing::warn!("Failed to fetch time status: {}", e);
+                self.time_info.clear();
+            }
+        }
+
+        // Build node statuses combining version and time info
+        self.node_statuses = self.versions
+            .iter()
+            .map(|v| {
+                // Look up time sync status for this node
+                let time_synced = self.time_info.iter()
+                    .find(|t| t.node == v.node)
+                    .map(|t| t.synced);
+
+                NodeStatus {
+                    hostname: v.node.clone(),
+                    version: v.version.clone(),
+                    config_hash: None, // Needs MachineConfig API
+                    time_synced,
+                    ready: true,       // Assume ready for now
+                    platform: v.platform.clone(),
+                }
+            })
+            .collect();
+
+        self.generate_alerts();
         self.loading = false;
         self.last_refresh = Some(Instant::now());
         Ok(())
@@ -199,12 +222,19 @@ impl LifecycleComponent {
             });
         }
 
-        // Placeholder alerts for features needing API extensions
-        self.alerts.push(Alert {
-            severity: AlertSeverity::Info,
-            message: "Time sync status requires TimeStatus API (run: talosctl get timestatus)".to_string(),
-        });
+        // Check for time sync issues
+        let unsynced_nodes: Vec<&str> = self.node_statuses.iter()
+            .filter(|n| n.time_synced == Some(false))
+            .map(|n| n.hostname.as_str())
+            .collect();
+        if !unsynced_nodes.is_empty() {
+            self.alerts.push(Alert {
+                severity: AlertSeverity::Warning,
+                message: format!("Time not synced on: {}", unsynced_nodes.join(", ")),
+            });
+        }
 
+        // Placeholder alert for config hash (still needs API)
         self.alerts.push(Alert {
             severity: AlertSeverity::Info,
             message: "Config hash requires MachineConfig API (run: talosctl get machineconfig)".to_string(),

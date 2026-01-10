@@ -75,6 +75,8 @@ pub use client::{
     ConnectionCounts, ConnectionInfo, ConnectionState, NetstatFilter, NodeConnections,
     // Configuration types
     ApplyConfigResult, ApplyMode,
+    // Time types
+    NodeTimeInfo,
 };
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;

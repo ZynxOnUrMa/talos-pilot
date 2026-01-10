@@ -7,6 +7,7 @@ use crate::config::{Context, TalosConfig};
 use crate::error::TalosError;
 use crate::proto::machine::machine_service_client::MachineServiceClient;
 use crate::proto::machine::{EtcdMemberListRequest, LogsRequest, NetstatRequest, netstat_request};
+use crate::proto::time::time_service_client::TimeServiceClient;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Request;
@@ -59,6 +60,11 @@ impl TalosClient {
         MachineServiceClient::new(self.channel.clone())
     }
 
+    /// Get a TimeService client
+    fn time_client(&self) -> TimeServiceClient<Channel> {
+        TimeServiceClient::new(self.channel.clone())
+    }
+
     /// Add node targeting metadata to a request
     /// If no explicit nodes are configured, don't add the header
     /// (Talos will respond from the endpoint node itself)
@@ -106,6 +112,62 @@ impl TalosClient {
             .collect();
 
         Ok(versions)
+    }
+
+    /// Get time synchronization status from all configured nodes
+    ///
+    /// Returns NTP server info, local and remote times, and sync status.
+    pub async fn time(&self) -> Result<Vec<NodeTimeInfo>, TalosError> {
+        let mut client = self.time_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.time(request).await?;
+        let inner = response.into_inner();
+
+        // Tolerance for considering time "synced" (in seconds)
+        const SYNC_TOLERANCE_SECS: f64 = 1.0;
+
+        let times: Vec<NodeTimeInfo> = inner
+            .messages
+            .into_iter()
+            .map(|msg| {
+                let local_time = msg.localtime.map(|t| {
+                    std::time::UNIX_EPOCH + std::time::Duration::new(
+                        t.seconds as u64,
+                        t.nanos as u32,
+                    )
+                });
+                let remote_time = msg.remotetime.map(|t| {
+                    std::time::UNIX_EPOCH + std::time::Duration::new(
+                        t.seconds as u64,
+                        t.nanos as u32,
+                    )
+                });
+
+                // Calculate offset
+                let offset_seconds = match (msg.localtime, msg.remotetime) {
+                    (Some(local), Some(remote)) => {
+                        let local_nanos = local.seconds as f64 * 1_000_000_000.0 + local.nanos as f64;
+                        let remote_nanos = remote.seconds as f64 * 1_000_000_000.0 + remote.nanos as f64;
+                        (local_nanos - remote_nanos) / 1_000_000_000.0
+                    }
+                    _ => 0.0,
+                };
+
+                let synced = offset_seconds.abs() < SYNC_TOLERANCE_SECS;
+
+                NodeTimeInfo {
+                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    server: msg.server,
+                    local_time,
+                    remote_time,
+                    offset_seconds,
+                    synced,
+                }
+            })
+            .collect();
+
+        Ok(times)
     }
 
     /// Get list of services from all configured nodes
@@ -1732,5 +1794,47 @@ impl ConnectionState {
     /// Check if this is a problematic state
     pub fn is_problematic(&self) -> bool {
         matches!(self, ConnectionState::CloseWait | ConnectionState::SynSent)
+    }
+}
+
+// ==================== Time Types ====================
+
+/// Time synchronization status for a node
+#[derive(Debug, Clone)]
+pub struct NodeTimeInfo {
+    /// Node hostname
+    pub node: String,
+    /// NTP server being used
+    pub server: String,
+    /// Local time
+    pub local_time: Option<std::time::SystemTime>,
+    /// Remote NTP time
+    pub remote_time: Option<std::time::SystemTime>,
+    /// Time offset from NTP server (in seconds, positive means local is ahead)
+    pub offset_seconds: f64,
+    /// Whether time is considered synced (offset within tolerance)
+    pub synced: bool,
+}
+
+impl NodeTimeInfo {
+    /// Get a human-readable offset string
+    pub fn offset_human(&self) -> String {
+        let offset_ms = (self.offset_seconds * 1000.0).abs();
+        if offset_ms < 1.0 {
+            format!("{:.3} ms", offset_ms)
+        } else if offset_ms < 1000.0 {
+            format!("{:.1} ms", offset_ms)
+        } else {
+            format!("{:.2} s", self.offset_seconds.abs())
+        }
+    }
+
+    /// Get sync status as a string
+    pub fn sync_status(&self) -> &'static str {
+        if self.synced {
+            "synced"
+        } else {
+            "not synced"
+        }
     }
 }
