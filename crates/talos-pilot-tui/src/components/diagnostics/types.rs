@@ -341,6 +341,8 @@ pub struct DiagnosticContext {
     pub pod_health: Option<PodHealthInfo>,
     /// Number of CPU cores (for load threshold scaling)
     pub cpu_count: usize,
+    /// K8s client error (if client creation failed)
+    pub k8s_error: Option<String>,
 }
 
 impl DiagnosticContext {
@@ -354,6 +356,7 @@ impl DiagnosticContext {
             cni_info: None,
             pod_health: None,
             cpu_count: 1,
+            k8s_error: None,
         }
     }
 }

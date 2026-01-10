@@ -191,10 +191,28 @@ pub async fn run_kubernetes_checks(
             ));
         }
     } else {
-        // K8s API not available - show as unknown rather than false-positive from logs
+        // K8s API not available - show the actual error if we have it
+        let details = if let Some(ref error) = ctx.k8s_error {
+            format!(
+                "K8s API unavailable - cannot check pod status.\n\n\
+                 Error: {}\n\n\
+                 Possible causes:\n\
+                 - Cluster is still starting up\n\
+                 - API server not ready yet\n\
+                 - kubeconfig not available from Talos\n\
+                 - Network/TLS issues connecting to API server",
+                error
+            )
+        } else {
+            "K8s API unavailable - cannot check pod status.\n\n\
+             Possible causes:\n\
+             - Cluster is still starting up\n\
+             - API server not ready yet\n\
+             - Try refreshing in a few seconds".to_string()
+        };
         checks.push(
             DiagnosticCheck::unknown("pod_health", "Pod Health")
-                .with_details("K8s API unavailable - cannot check pod status"),
+                .with_details(&details),
         );
     }
 

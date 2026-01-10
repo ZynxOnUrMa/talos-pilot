@@ -71,6 +71,13 @@ pub struct DiagnosticsComponent {
     /// Time when command was copied (for showing feedback)
     copy_feedback_until: Option<Instant>,
 
+    /// Whether we're showing a details popup (for checks without fixes)
+    show_details: bool,
+    /// Title of the details popup
+    details_title: String,
+    /// Content of the details popup
+    details_content: String,
+
     /// Whether we're applying a fix
     applying_fix: bool,
     /// Result of the last apply
@@ -120,6 +127,9 @@ impl DiagnosticsComponent {
             show_confirmation: false,
             confirmation_selection: 1,
             copy_feedback_until: None,
+            show_details: false,
+            details_title: String::new(),
+            details_content: String::new(),
             applying_fix: false,
             apply_result: None,
             loading: true,
@@ -207,10 +217,21 @@ impl DiagnosticsComponent {
         self.table_state.select(Some(self.selected_check));
     }
 
-    /// Initiate a fix action for the currently selected check
+    /// Initiate a fix action or show details for the currently selected check
     fn initiate_fix(&mut self) {
-        if let Some(check) = self.selected_check() {
-            if let Some(fix) = &check.fix {
+        // Extract info from check first to avoid borrow issues
+        let check_info = self.selected_check().map(|check| {
+            (
+                check.id.clone(),
+                check.name.clone(),
+                check.fix.clone(),
+                check.details.clone(),
+            )
+        });
+
+        if let Some((check_id, check_name, fix_opt, details_opt)) = check_info {
+            if let Some(fix) = fix_opt {
+                // Has a fix - show confirmation dialog
                 let preview = match &fix.action {
                     FixAction::AddKernelModule(name) => Some(format!(
                         "machine:\n  kernel:\n    modules:\n      - name: {}",
@@ -223,13 +244,18 @@ impl DiagnosticsComponent {
                 let is_host_cmd = fix.action.is_host_command();
 
                 self.pending_action = Some(PendingAction {
-                    check_id: check.id.clone(),
-                    fix: fix.clone(),
+                    check_id,
+                    fix,
                     preview,
                 });
                 self.show_confirmation = true;
                 self.confirmation_selection = if is_host_cmd { 0 } else { 1 };
                 self.copy_feedback_until = None;
+            } else if let Some(details) = details_opt {
+                // No fix but has details - show details popup
+                self.details_title = check_name;
+                self.details_content = details;
+                self.show_details = true;
             }
         }
     }
@@ -365,30 +391,53 @@ impl DiagnosticsComponent {
             }
         }
 
-        // Detect CNI type (tries K8s API, falls back to logs)
-        let (cni_type, cni_info) = cni::detect_cni(client).await;
+        // Try to create K8s client once for all K8s-based checks
+        let k8s_client = match k8s::create_k8s_client(client).await {
+            Ok(client) => {
+                tracing::info!("K8s client created successfully");
+                self.context.k8s_error = None;
+                Some(client)
+            }
+            Err(e) => {
+                let error_msg = format!("{}", e);
+                tracing::warn!("Failed to create K8s client: {} - K8s-based checks will be limited", error_msg);
+                self.context.k8s_error = Some(error_msg);
+                None
+            }
+        };
+
+        // Detect CNI type (uses K8s API if available, falls back to file checks)
+        let (cni_type, cni_info) = cni::detect_cni_with_client(client, k8s_client.as_ref()).await;
         self.context.cni_type = cni_type;
         self.context.cni_info = cni_info;
         tracing::info!("Detected CNI: {:?}", self.context.cni_type);
 
-        // Get pod health from K8s API (if available)
-        if let Ok(k8s_client) = k8s::create_k8s_client(client).await {
-            match k8s::check_pod_health(&k8s_client).await {
+        // Get pod health from K8s API (reusing the same client)
+        if let Some(ref kc) = k8s_client {
+            match k8s::check_pod_health(kc).await {
                 Ok(health) => {
                     // Convert k8s::PodHealthInfo to types::PodHealthInfo
                     let pod_health = PodHealthInfo {
-                        crashing: health.crashing.iter().map(|p| UnhealthyPodInfo {
-                            name: p.name.clone(),
-                            namespace: p.namespace.clone(),
-                            state: p.state.clone(),
-                            restart_count: p.restart_count,
-                        }).collect(),
-                        image_pull_errors: health.image_pull_errors.iter().map(|p| UnhealthyPodInfo {
-                            name: p.name.clone(),
-                            namespace: p.namespace.clone(),
-                            state: p.state.clone(),
-                            restart_count: p.restart_count,
-                        }).collect(),
+                        crashing: health
+                            .crashing
+                            .iter()
+                            .map(|p| UnhealthyPodInfo {
+                                name: p.name.clone(),
+                                namespace: p.namespace.clone(),
+                                state: p.state.clone(),
+                                restart_count: p.restart_count,
+                            })
+                            .collect(),
+                        image_pull_errors: health
+                            .image_pull_errors
+                            .iter()
+                            .map(|p| UnhealthyPodInfo {
+                                name: p.name.clone(),
+                                namespace: p.namespace.clone(),
+                                state: p.state.clone(),
+                                restart_count: p.restart_count,
+                            })
+                            .collect(),
                         total_pods: health.total_pods,
                     };
                     self.context.pod_health = Some(pod_health);
@@ -666,10 +715,72 @@ impl DiagnosticsComponent {
         let content = Paragraph::new(lines);
         frame.render_widget(content, inner);
     }
+
+    /// Render the details popup
+    fn render_details(&self, frame: &mut Frame, area: Rect) {
+        if !self.show_details {
+            return;
+        }
+
+        // Calculate dialog size based on content
+        let content_lines: Vec<&str> = self.details_content.lines().collect();
+        let max_line_len = content_lines.iter().map(|l| l.len()).max().unwrap_or(40);
+
+        let dialog_width = (max_line_len as u16 + 6).min(80).max(50).min(area.width.saturating_sub(4));
+        let dialog_height = (content_lines.len() as u16 + 6).min(20).min(area.height.saturating_sub(4));
+        let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
+        let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
+
+        let dialog_area = Rect::new(
+            area.x + dialog_x,
+            area.y + dialog_y,
+            dialog_width,
+            dialog_height,
+        );
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", self.details_title))
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let mut lines = vec![Line::from("")];
+
+        for line in self.details_content.lines() {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", line),
+                Style::default().fg(Color::White),
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Press Enter or Esc to close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let content = Paragraph::new(lines);
+        frame.render_widget(content, inner);
+    }
 }
 
 impl Component for DiagnosticsComponent {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        // Handle details popup (if showing)
+        if self.show_details {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.show_details = false;
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+
         if self.show_confirmation {
             let is_host_command = self
                 .pending_action
@@ -840,7 +951,7 @@ impl Component for DiagnosticsComponent {
             Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
             Span::raw(" Section  "),
             Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Apply fix  "),
+            Span::raw(" Details/Fix  "),
             Span::styled("[r]", Style::default().fg(Color::Cyan)),
             Span::raw(" Refresh  "),
             Span::styled("[q]", Style::default().fg(Color::Cyan)),
@@ -850,6 +961,10 @@ impl Component for DiagnosticsComponent {
 
         if self.show_confirmation {
             self.render_confirmation(frame, area);
+        }
+
+        if self.show_details {
+            self.render_details(frame, area);
         }
 
         Ok(())
