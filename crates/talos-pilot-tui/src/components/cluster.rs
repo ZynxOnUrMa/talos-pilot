@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Borders, ListState, Paragraph},
     Frame,
 };
 use std::collections::HashMap;
@@ -34,7 +34,65 @@ struct VipInfo {
     /// The VIP address
     address: String,
     /// Node currently holding the VIP
+    #[allow(dead_code)]
     holder: String,
+}
+
+/// Which pane is currently focused
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusedPane {
+    #[default]
+    Nodes,
+    Menu,
+    Services,
+}
+
+/// Navigation menu items for quick screen access
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMenuItem {
+    Logs,
+    Etcd,
+    Network,
+    Processes,
+    Diagnostics,
+    Certs,
+    Lifecycle,
+}
+
+impl NavMenuItem {
+    const ALL: [NavMenuItem; 7] = [
+        NavMenuItem::Logs,
+        NavMenuItem::Etcd,
+        NavMenuItem::Network,
+        NavMenuItem::Processes,
+        NavMenuItem::Diagnostics,
+        NavMenuItem::Certs,
+        NavMenuItem::Lifecycle,
+    ];
+
+    fn label(&self) -> &'static str {
+        match self {
+            NavMenuItem::Logs => "Logs",
+            NavMenuItem::Etcd => "etcd",
+            NavMenuItem::Network => "Net",
+            NavMenuItem::Processes => "Proc",
+            NavMenuItem::Diagnostics => "Diag",
+            NavMenuItem::Certs => "Certs",
+            NavMenuItem::Lifecycle => "Life",
+        }
+    }
+
+    fn hotkey(&self) -> &'static str {
+        match self {
+            NavMenuItem::Logs => "L",
+            NavMenuItem::Etcd => "e",
+            NavMenuItem::Network => "n",
+            NavMenuItem::Processes => "p",
+            NavMenuItem::Diagnostics => "d",
+            NavMenuItem::Certs => "c",
+            NavMenuItem::Lifecycle => "y",
+        }
+    }
 }
 
 /// Cluster component showing overview with node list
@@ -73,6 +131,10 @@ pub struct ClusterComponent {
     last_refresh: Option<std::time::Instant>,
     /// VIP info (if configured)
     vip_info: Option<VipInfo>,
+    /// Which pane is currently focused
+    focused_pane: FocusedPane,
+    /// Currently selected navigation menu item
+    selected_menu_item: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +174,8 @@ impl ClusterComponent {
             error: None,
             last_refresh: None,
             vip_info: None,
+            focused_pane: FocusedPane::Nodes,
+            selected_menu_item: 0,
         }
     }
 
@@ -327,22 +391,6 @@ impl ClusterComponent {
         Ok(())
     }
 
-    /// Move selection up
-    fn select_previous(&mut self) {
-        if !self.versions.is_empty() {
-            self.selected = self.selected.saturating_sub(1);
-            self.list_state.select(Some(self.selected));
-        }
-    }
-
-    /// Move selection down
-    fn select_next(&mut self) {
-        if !self.versions.is_empty() {
-            self.selected = (self.selected + 1).min(self.versions.len() - 1);
-            self.list_state.select(Some(self.selected));
-        }
-    }
-
     /// Get services for a node
     fn get_node_services(&self, node_name: &str) -> Option<&Vec<ServiceInfo>> {
         self.services
@@ -425,50 +473,21 @@ impl ClusterComponent {
             "worker".to_string()
         }
     }
-}
 
-impl Component for ClusterComponent {
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Quit)),
-            KeyCode::Char('r') => Ok(Some(Action::Refresh)),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.select_previous();
-                self.selected_service = 0; // Reset service selection when changing nodes
-                Ok(None)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.select_next();
-                self.selected_service = 0; // Reset service selection when changing nodes
-                Ok(None)
-            }
-            KeyCode::Tab => {
-                // Cycle through services
-                let count = self.current_service_count();
-                if count > 0 {
-                    self.selected_service = (self.selected_service + 1) % count;
-                }
-                Ok(None)
-            }
-            KeyCode::BackTab => {
-                // Cycle through services backwards
-                let count = self.current_service_count();
-                if count > 0 {
-                    self.selected_service = if self.selected_service == 0 {
-                        count - 1
-                    } else {
-                        self.selected_service - 1
-                    };
-                }
-                Ok(None)
-            }
-            KeyCode::Enter | KeyCode::Char('l') => {
-                // View multi-service logs for current node
+    /// Navigate to the currently selected menu item (1-based index, 0 = on node)
+    fn navigate_to_selected_menu(&self) -> Result<Option<Action>> {
+        if self.selected_menu_item == 0 || self.selected_menu_item > NavMenuItem::ALL.len() {
+            return Ok(None);
+        }
+        let menu_item = NavMenuItem::ALL[self.selected_menu_item - 1];
+        match menu_item {
+            NavMenuItem::Logs => {
+                // Show all logs for selected node
                 if let Some(node_name) = self.current_node_name() {
                     let service_ids = self.current_service_ids();
                     if !service_ids.is_empty() {
                         let node_role = self.current_node_role();
-                        Ok(Some(Action::ShowMultiLogs(node_name, node_role, service_ids)))
+                        Ok(Some(Action::ShowMultiLogs(node_name, node_role, service_ids.clone(), service_ids)))
                     } else {
                         Ok(None)
                     }
@@ -476,56 +495,201 @@ impl Component for ClusterComponent {
                     Ok(None)
                 }
             }
-            KeyCode::Char('e') => {
-                // View etcd cluster status
-                Ok(Some(Action::ShowEtcd))
-            }
-            KeyCode::Char('p') => {
-                // View processes for current node
+            NavMenuItem::Etcd => Ok(Some(Action::ShowEtcd)),
+            NavMenuItem::Network => {
                 if let Some(node_name) = self.current_node_name() {
-                    // Look up the IP address for this node
                     let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
-                    tracing::info!("Cluster: pressing p, node_name='{}', ip='{}'", node_name, node_ip);
+                    Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    Ok(None)
+                }
+            }
+            NavMenuItem::Processes => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowProcesses(node_name, node_ip)))
                 } else {
-                    tracing::warn!("Cluster: pressing p, but no node selected");
+                    Ok(None)
+                }
+            }
+            NavMenuItem::Diagnostics => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_role = self.current_node_role();
+                    Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
+                } else {
+                    Ok(None)
+                }
+            }
+            NavMenuItem::Certs => Ok(Some(Action::ShowSecurity)),
+            NavMenuItem::Lifecycle => Ok(Some(Action::ShowLifecycle)),
+        }
+    }
+
+}
+
+impl Component for ClusterComponent {
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Quit)),
+            KeyCode::Char('r') => Ok(Some(Action::Refresh)),
+
+            // Vertical navigation within focused pane
+            KeyCode::Up | KeyCode::Char('k') => {
+                match self.focused_pane {
+                    FocusedPane::Nodes => {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                            self.list_state.select(Some(self.selected));
+                        }
+                    }
+                    FocusedPane::Menu => {
+                        if self.selected_menu_item > 1 {
+                            self.selected_menu_item -= 1;
+                        }
+                    }
+                    FocusedPane::Services => {
+                        let count = self.current_service_count();
+                        if count > 0 && self.selected_service > 0 {
+                            self.selected_service -= 1;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match self.focused_pane {
+                    FocusedPane::Nodes => {
+                        let node_count = self.versions.len();
+                        if node_count > 0 && self.selected < node_count - 1 {
+                            self.selected += 1;
+                            self.list_state.select(Some(self.selected));
+                        }
+                    }
+                    FocusedPane::Menu => {
+                        let menu_count = NavMenuItem::ALL.len();
+                        if self.selected_menu_item < menu_count {
+                            self.selected_menu_item += 1;
+                        }
+                    }
+                    FocusedPane::Services => {
+                        let count = self.current_service_count();
+                        if count > 0 && self.selected_service < count - 1 {
+                            self.selected_service += 1;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
+            // Switch focus between panes: Nodes → Menu → Services → Nodes
+            KeyCode::Tab => {
+                self.focused_pane = match self.focused_pane {
+                    FocusedPane::Nodes => FocusedPane::Menu,
+                    FocusedPane::Menu => FocusedPane::Services,
+                    FocusedPane::Services => FocusedPane::Nodes,
+                };
+                // Reset menu selection when entering menu
+                if self.focused_pane == FocusedPane::Menu && self.selected_menu_item == 0 {
+                    self.selected_menu_item = 1;
+                }
+                Ok(None)
+            }
+            KeyCode::BackTab => {
+                self.focused_pane = match self.focused_pane {
+                    FocusedPane::Nodes => FocusedPane::Services,
+                    FocusedPane::Menu => FocusedPane::Nodes,
+                    FocusedPane::Services => FocusedPane::Menu,
+                };
+                if self.focused_pane == FocusedPane::Menu && self.selected_menu_item == 0 {
+                    self.selected_menu_item = 1;
+                }
+                Ok(None)
+            }
+
+            // Enter: action depends on focused pane
+            KeyCode::Enter => {
+                match self.focused_pane {
+                    FocusedPane::Nodes => {
+                        // On a node - show all logs for that node
+                        if let Some(node_name) = self.current_node_name() {
+                            let service_ids = self.current_service_ids();
+                            if !service_ids.is_empty() {
+                                let node_role = self.current_node_role();
+                                Ok(Some(Action::ShowMultiLogs(node_name, node_role, service_ids.clone(), service_ids)))
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    FocusedPane::Menu => {
+                        // Navigate to selected screen
+                        self.navigate_to_selected_menu()
+                    }
+                    FocusedPane::Services => {
+                        // Show logs for selected service (but include all services as available)
+                        if let Some(node_name) = self.current_node_name() {
+                            if let Some(service_id) = self.selected_service_id() {
+                                let node_role = self.current_node_role();
+                                let all_services = self.current_service_ids();
+                                Ok(Some(Action::ShowMultiLogs(node_name, node_role, vec![service_id], all_services)))
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }
+            }
+
+            // 'l' / 'L' - show logs (all services for node)
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                if let Some(node_name) = self.current_node_name() {
+                    let service_ids = self.current_service_ids();
+                    if !service_ids.is_empty() {
+                        let node_role = self.current_node_role();
+                        Ok(Some(Action::ShowMultiLogs(node_name, node_role, service_ids.clone(), service_ids)))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+
+            // Direct hotkeys for screens (always work)
+            KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
+            KeyCode::Char('p') => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    Ok(Some(Action::ShowProcesses(node_name, node_ip)))
+                } else {
                     Ok(None)
                 }
             }
             KeyCode::Char('n') => {
-                // View network stats for current node
                 if let Some(node_name) = self.current_node_name() {
-                    // Look up the IP address for this node
                     let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
-                    tracing::info!("Cluster: pressing n, node_name='{}', ip='{}'", node_name, node_ip);
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
                 } else {
-                    tracing::warn!("Cluster: pressing n, but no node selected");
                     Ok(None)
                 }
             }
             KeyCode::Char('d') => {
-                // View diagnostics for current node
                 if let Some(node_name) = self.current_node_name() {
                     let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
                     let node_role = self.current_node_role();
-                    tracing::info!("Cluster: pressing d, node_name='{}', ip='{}', role='{}'", node_name, node_ip, node_role);
                     Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
                 } else {
-                    tracing::warn!("Cluster: pressing d, but no node selected");
                     Ok(None)
                 }
             }
-            KeyCode::Char('c') => {
-                // View security/certificates
-                tracing::info!("Cluster: pressing c, showing security view");
-                Ok(Some(Action::ShowSecurity))
-            }
-            KeyCode::Char('L') => {
-                // View lifecycle/versions
-                tracing::info!("Cluster: pressing L, showing lifecycle view");
-                Ok(Some(Action::ShowLifecycle))
-            }
+            KeyCode::Char('c') => Ok(Some(Action::ShowSecurity)),
+            KeyCode::Char('y') => Ok(Some(Action::ShowLifecycle)),
+
             _ => Ok(None),
         }
     }
@@ -538,124 +702,49 @@ impl Component for ClusterComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
+        // Two-column layout inspired by lazygit
         let layout = Layout::vertical([
-            Constraint::Length(3), // Header
-            Constraint::Min(0),    // Content
-            Constraint::Length(3), // Footer
+            Constraint::Length(2), // Header
+            Constraint::Min(8),    // Main content (two columns)
+            Constraint::Length(2), // Footer
         ])
         .split(area);
 
-        // Header
-        let status_indicator = match &self.state {
-            ConnectionState::Connected => Span::raw(" ● ").fg(Color::Green),
-            ConnectionState::Connecting => Span::raw(" ◐ ").fg(Color::Yellow),
-            ConnectionState::Disconnected => Span::raw(" ○ ").fg(Color::DarkGray),
-            ConnectionState::Error(_) => Span::raw(" ✗ ").fg(Color::Red),
-        };
+        // Draw header
+        self.draw_header(frame, layout[0]);
 
-        // Build etcd status indicator for header
-        let etcd_spans = if let Some(etcd) = &self.etcd_summary {
-            let (indicator, color) = if etcd.has_quorum && etcd.healthy == etcd.total {
-                ("●", Color::Green)
-            } else if etcd.has_quorum {
-                ("◐", Color::Yellow)
-            } else {
-                ("✗", Color::Red)
-            };
-            vec![
-                Span::raw("    etcd ").dim(),
-                Span::styled(indicator, Style::default().fg(color)),
-                Span::raw(format!(" {}/{}", etcd.healthy, etcd.total)).dim(),
-            ]
-        } else {
-            vec![]
-        };
-
-        // Build VIP status indicator for header
-        let vip_spans = if let Some(vip) = &self.vip_info {
-            vec![
-                Span::raw("    VIP ").dim(),
-                Span::styled("●", Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" {} → {}", vip.address, vip.holder)).dim(),
-            ]
-        } else {
-            vec![]
-        };
-
-        let mut header_spans = vec![
-            Span::raw(" talos-pilot ").bold().fg(Color::Cyan),
-            status_indicator,
-            Span::raw(match &self.state {
-                ConnectionState::Connected => "Connected",
-                ConnectionState::Connecting => "Connecting...",
-                ConnectionState::Disconnected => "Disconnected",
-                ConnectionState::Error(e) => e.as_str(),
-            })
-            .dim(),
-        ];
-        header_spans.extend(etcd_spans);
-        header_spans.extend(vip_spans);
-
-        let header = Paragraph::new(Line::from(header_spans))
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-        frame.render_widget(header, layout[0]);
-
-        // Content area - split into node list and details
+        // Two-column layout for main content
         let content_layout = Layout::horizontal([
-            Constraint::Percentage(40), // Node list
-            Constraint::Percentage(60), // Details
+            Constraint::Percentage(40), // Nodes pane
+            Constraint::Percentage(60), // Details pane
         ])
         .split(layout[1]);
 
-        // Node list
-        self.draw_node_list(frame, content_layout[0]);
+        // Draw panes with focus indication
+        self.draw_nodes_pane(frame, content_layout[0]);
+        self.draw_details_pane(frame, content_layout[1]);
 
-        // Node details
-        self.draw_node_details(frame, content_layout[1]);
-
-        // Footer - two lines for all shortcuts
-        let footer_lines = vec![
-            Line::from(vec![
-                Span::raw(" [q]").fg(Color::Yellow),
-                Span::raw(" quit").dim(),
-                Span::raw("  "),
-                Span::raw("[r]").fg(Color::Yellow),
-                Span::raw(" refresh").dim(),
-                Span::raw("  "),
-                Span::raw("[↑↓]").fg(Color::Yellow),
-                Span::raw(" nodes").dim(),
-                Span::raw("  "),
-                Span::raw("[Tab]").fg(Color::Yellow),
-                Span::raw(" services").dim(),
-                Span::raw("  "),
-                Span::raw("[Enter]").fg(Color::Yellow),
-                Span::raw(" logs").dim(),
-                Span::raw("  "),
-                Span::raw("[e]").fg(Color::Yellow),
-                Span::raw(" etcd").dim(),
-            ]),
-            Line::from(vec![
-                Span::raw(" [p]").fg(Color::Yellow),
-                Span::raw(" procs").dim(),
-                Span::raw("  "),
-                Span::raw("[n]").fg(Color::Yellow),
-                Span::raw(" network").dim(),
-                Span::raw("  "),
-                Span::raw("[d]").fg(Color::Yellow),
-                Span::raw(" diagnostics").dim(),
-                Span::raw("  "),
-                Span::raw("[c]").fg(Color::Yellow),
-                Span::raw(" security").dim(),
-                Span::raw("  "),
-                Span::raw("[L]").fg(Color::Yellow),
-                Span::raw(" lifecycle").dim(),
-            ]),
-        ];
-        let footer = Paragraph::new(footer_lines)
+        // Compact footer with essential controls
+        let footer_line = Line::from(vec![
+            Span::styled(" [j/k]", Style::default().fg(Color::Yellow)),
+            Span::styled(" navigate", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[Tab]", Style::default().fg(Color::Yellow)),
+            Span::styled(" services", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+            Span::styled(" select", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[l]", Style::default().fg(Color::Yellow)),
+            Span::styled(" logs", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::styled(" refresh", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[q]", Style::default().fg(Color::Yellow)),
+            Span::styled(" quit", Style::default().dim()),
+        ]);
+        let footer = Paragraph::new(footer_line)
             .block(
                 Block::default()
                     .borders(Borders::TOP)
@@ -668,249 +757,333 @@ impl Component for ClusterComponent {
 }
 
 impl ClusterComponent {
-    fn draw_node_list(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .versions
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let node_name = if v.node.is_empty() {
-                    "node-0".to_string()
-                } else {
-                    v.node.clone()
-                };
-
-                // Get the IP for this node (if different from hostname)
-                let node_ip = self.node_ips.get(&node_name).cloned();
-                let display_name = if let Some(ref ip) = node_ip {
-                    if ip != &node_name {
-                        format!("{} ({})", node_name, ip)
-                    } else {
-                        node_name.clone()
-                    }
-                } else {
-                    node_name.clone()
-                };
-
-                // Get health status from services
-                let health_symbol = self
-                    .get_node_services(&v.node)
-                    .map(|services| {
-                        let unhealthy = services
-                            .iter()
-                            .filter(|s| s.health.as_ref().map(|h| !h.healthy).unwrap_or(false))
-                            .count();
-                        if unhealthy > 0 {
-                            "◐"
-                        } else {
-                            "●"
-                        }
-                    })
-                    .unwrap_or("?");
-
-                let health_color = match health_symbol {
-                    "●" => Color::Green,
-                    "◐" => Color::Yellow,
-                    _ => Color::DarkGray,
-                };
-
-                let style = if i == self.selected {
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!(" {} ", health_symbol)).fg(health_color),
-                    Span::raw(display_name).style(style),
-                ]))
-            })
-            .collect();
-
-        // If no nodes, show placeholder
-        let items = if items.is_empty() {
-            vec![ListItem::new(Line::from(
-                Span::raw("  No nodes connected").dim(),
-            ))]
-        } else {
-            items
+    /// Draw compact header with status indicators
+    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let status_indicator = match &self.state {
+            ConnectionState::Connected => Span::styled(" ● ", Style::default().fg(Color::Green)),
+            ConnectionState::Connecting => Span::styled(" ◐ ", Style::default().fg(Color::Yellow)),
+            ConnectionState::Disconnected => Span::styled(" ○ ", Style::default().fg(Color::DarkGray)),
+            ConnectionState::Error(_) => Span::styled(" ✗ ", Style::default().fg(Color::Red)),
         };
 
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(" Nodes ")
-                    .title_style(Style::default().fg(Color::Cyan).bold())
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .highlight_style(Style::default().bg(Color::DarkGray));
+        let status_text = match &self.state {
+            ConnectionState::Connected => "Connected",
+            ConnectionState::Connecting => "Connecting...",
+            ConnectionState::Disconnected => "Disconnected",
+            ConnectionState::Error(e) => e.as_str(),
+        };
 
-        frame.render_stateful_widget(list, area, &mut self.list_state);
+        // Build etcd status
+        let etcd_spans = if let Some(etcd) = &self.etcd_summary {
+            let (indicator, color) = if etcd.has_quorum && etcd.healthy == etcd.total {
+                ("●", Color::Green)
+            } else if etcd.has_quorum {
+                ("◐", Color::Yellow)
+            } else {
+                ("✗", Color::Red)
+            };
+            vec![
+                Span::raw("   etcd "),
+                Span::styled(format!("{}/{} ", etcd.healthy, etcd.total), Style::default().fg(color)),
+                Span::styled(indicator, Style::default().fg(color)),
+            ]
+        } else {
+            vec![]
+        };
+
+        // Build VIP status
+        let vip_spans = if let Some(vip) = &self.vip_info {
+            vec![
+                Span::raw("   VIP "),
+                Span::styled(&vip.address, Style::default().fg(Color::Cyan)),
+            ]
+        } else {
+            vec![]
+        };
+
+        // Context name (use first node's hostname prefix or "cluster")
+        let context_name = self.context.clone().unwrap_or_else(|| "cluster".to_string());
+
+        let mut header_spans = vec![
+            Span::styled(" talos-pilot ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            status_indicator,
+            Span::styled(status_text, Style::default().dim()),
+        ];
+        header_spans.extend(etcd_spans);
+        header_spans.extend(vip_spans);
+
+        // Right-align context name
+        let left_content = Line::from(header_spans);
+        let right_content = Span::styled(format!(" {} ", context_name), Style::default().fg(Color::DarkGray));
+
+        // Render header
+        let header_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray));
+
+        let inner = header_block.inner(area);
+        frame.render_widget(header_block, area);
+        frame.render_widget(Paragraph::new(left_content), inner);
+
+        // Right-align context
+        let right_area = Rect {
+            x: area.x + area.width.saturating_sub(context_name.len() as u16 + 3),
+            y: area.y,
+            width: context_name.len() as u16 + 3,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(right_content), right_area);
     }
 
-    fn draw_node_details(&self, frame: &mut Frame, area: Rect) {
+    /// Draw the nodes pane (left column) with navigation menu below
+    fn draw_nodes_pane(&self, frame: &mut Frame, area: Rect) {
+        // Focus indication - cyan border when focused
+        let border_color = if self.focused_pane == FocusedPane::Nodes {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
         let block = Block::default()
-            .title(" Details ")
-            .title_style(Style::default().fg(Color::Cyan).bold())
+            .title(" Nodes ")
+            .title_style(Style::default().fg(if self.focused_pane == FocusedPane::Nodes { Color::Cyan } else { Color::White }))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(border_color));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Split inner area: nodes list at top, nav menu at bottom
+        let menu_height = NavMenuItem::ALL.len() as u16 + 1; // +1 for separator
+        let pane_layout = Layout::vertical([
+            Constraint::Min(3),              // Nodes list
+            Constraint::Length(menu_height), // Navigation menu (vertical)
+        ])
+        .split(inner);
+
         if self.versions.is_empty() {
-            let msg = Paragraph::new(Line::from(Span::raw("No node selected").dim()));
-            frame.render_widget(msg, inner);
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "  No nodes connected",
+                Style::default().dim(),
+            )));
+            frame.render_widget(msg, pane_layout[0]);
+        } else {
+            // Build node list with inline stats
+            let mut lines = Vec::new();
+
+            for (i, v) in self.versions.iter().enumerate() {
+                let node_name = if v.node.is_empty() { "node-0".to_string() } else { v.node.clone() };
+
+                // Health indicator based on services and memory
+                let mem_pct = self.get_node_memory(&v.node)
+                    .map(|m| m.usage_percent())
+                    .unwrap_or(0.0);
+                let svc_healthy = self.get_node_services(&v.node)
+                    .map(|services| services.iter().all(|s| s.health.as_ref().map(|h| h.healthy).unwrap_or(true)))
+                    .unwrap_or(true);
+                let health_symbol = if svc_healthy && mem_pct < 90.0 { "●" } else { "◐" };
+                let health_color = if svc_healthy && mem_pct < 90.0 { Color::Green } else { Color::Yellow };
+
+                // Selection indicator - only show when Nodes pane is focused
+                let is_selected = i == self.selected;
+                let show_selector = is_selected && self.focused_pane == FocusedPane::Nodes;
+                let selector = if show_selector { "▸" } else { " " };
+                let name_style = if is_selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {} {} ", selector, health_symbol), Style::default().fg(health_color)),
+                    Span::styled(node_name, name_style),
+                ]));
+            }
+
+            frame.render_widget(Paragraph::new(lines), pane_layout[0]);
+        }
+
+        // Draw navigation menu
+        self.draw_nav_menu(frame, pane_layout[1]);
+    }
+
+    /// Draw the navigation menu (vertical list)
+    fn draw_nav_menu(&self, frame: &mut Frame, area: Rect) {
+        let menu_focused = self.focused_pane == FocusedPane::Menu;
+        let mut lines = Vec::new();
+
+        // Separator line with focus color
+        let sep_color = if menu_focused { Color::Cyan } else { Color::DarkGray };
+        let sep_text = if menu_focused {
+            " Navigate ".to_string()
+        } else {
+            "─".repeat(area.width as usize)
+        };
+        lines.push(Line::from(Span::styled(sep_text, Style::default().fg(sep_color))));
+
+        // Menu items (1-indexed, 0 means not in menu)
+        for (i, item) in NavMenuItem::ALL.iter().enumerate() {
+            let menu_index = i + 1; // 1-based for selection
+            let is_selected = menu_index == self.selected_menu_item;
+            let show_selector = is_selected && menu_focused;
+
+            let selector = if show_selector { "▸" } else { " " };
+
+            let hotkey_style = if show_selector {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
+            let label_style = if show_selector {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if is_selected && !menu_focused {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", selector), if show_selector { Style::default().fg(Color::Cyan) } else { Style::default() }),
+                Span::styled(format!("[{}] ", item.hotkey()), hotkey_style),
+                Span::styled(item.label(), label_style),
+            ]));
+        }
+
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Render a compact ASCII bar for percentage values
+    fn render_compact_bar(pct: f32, width: usize) -> String {
+        let filled = ((pct / 100.0) * width as f32).round() as usize;
+        let empty = width.saturating_sub(filled);
+        format!("{}{}{:>3}%", "█".repeat(filled), "░".repeat(empty), pct as u8)
+    }
+
+    /// Draw the details pane (right column)
+    fn draw_details_pane(&self, frame: &mut Frame, area: Rect) {
+        // Focus indication - cyan border when focused
+        let border_color = if self.focused_pane == FocusedPane::Services {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
+        if self.versions.is_empty() {
+            let block = Block::default()
+                .title(" Details ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "  No node selected",
+                Style::default().dim(),
+            ))).block(block);
+            frame.render_widget(msg, area);
             return;
         }
 
         let version = &self.versions[self.selected];
-        let node_name = &version.node;
+        let node_name = if version.node.is_empty() { "node-0" } else { &version.node };
+        let node_ip = self.node_ips.get(node_name).cloned().unwrap_or_default();
+        let role = if self.get_node_services(&version.node)
+            .map(|s| s.iter().any(|svc| svc.id == "etcd"))
+            .unwrap_or(false)
+        { "controlplane" } else { "worker" };
 
-        // Build detail layout
-        let detail_layout = Layout::vertical([
-            Constraint::Length(5), // Version info
-            Constraint::Length(6), // Resource usage (memory, load, cpu)
-            Constraint::Min(0),    // Services
+        let title = format!(" {} · {} ", node_name, role);
+        let block = Block::default()
+            .title(title)
+            .title_style(Style::default().fg(if self.focused_pane == FocusedPane::Services { Color::Cyan } else { Color::White }))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Split into resources and services
+        let panel_layout = Layout::vertical([
+            Constraint::Length(5), // Resources
+            Constraint::Min(4),    // Services
         ])
         .split(inner);
 
-        // Version info section
-        let version_info = vec![
+        // Resources section
+        let mut resource_lines = vec![
             Line::from(vec![
-                Span::raw(" Version:  ").dim(),
-                Span::raw(&version.version).fg(Color::White),
-            ]),
-            Line::from(vec![
-                Span::raw(" SHA:      ").dim(),
-                Span::raw(&version.sha).fg(Color::DarkGray),
-            ]),
-            Line::from(vec![
-                Span::raw(" OS/Arch:  ").dim(),
-                Span::raw(format!("{}/{}", version.os, version.arch)).fg(Color::White),
+                Span::styled(" IP: ", Style::default().dim()),
+                Span::styled(&node_ip, Style::default().fg(Color::DarkGray)),
             ]),
         ];
-        frame.render_widget(Paragraph::new(version_info), detail_layout[0]);
 
-        // Resource usage section
-        let mut resource_lines = Vec::new();
-
-        // Memory
-        if let Some(mem) = self.get_node_memory(node_name) {
-            let usage_pct = mem.usage_percent();
-            let usage_color = if usage_pct > 90.0 {
-                Color::Red
-            } else if usage_pct > 70.0 {
-                Color::Yellow
-            } else {
-                Color::Green
-            };
-
+        // Memory bar
+        if let Some(mem) = self.get_node_memory(&version.node) {
+            let pct = mem.usage_percent();
+            let used_gb = (mem.mem_total - mem.mem_available) as f64 / 1024.0 / 1024.0 / 1024.0;
+            let total_gb = mem.mem_total as f64 / 1024.0 / 1024.0 / 1024.0;
+            let bar = Self::render_compact_bar(pct, 10);
+            let color = if pct > 90.0 { Color::Red } else if pct > 70.0 { Color::Yellow } else { Color::Green };
             resource_lines.push(Line::from(vec![
-                Span::raw(" Memory:   ").dim(),
-                Span::raw(format!("{:.1}%", usage_pct)).fg(usage_color),
-                Span::raw(format!(
-                    " ({} MB / {} MB)",
-                    mem.mem_available / 1024 / 1024,
-                    mem.mem_total / 1024 / 1024
-                ))
-                .dim(),
+                Span::styled(" Memory: ", Style::default().dim()),
+                Span::styled(bar, Style::default().fg(color)),
+                Span::styled(format!(" {:.1}/{:.1}GB", used_gb, total_gb), Style::default().dim()),
             ]));
         }
 
         // Load average
-        if let Some(load) = self.get_node_load_avg(node_name) {
-            let load_color = if load.load1 > 4.0 {
-                Color::Red
-            } else if load.load1 > 2.0 {
-                Color::Yellow
-            } else {
-                Color::Green
-            };
-
+        if let Some(load) = self.get_node_load_avg(&version.node) {
+            let color = if load.load1 > 4.0 { Color::Red } else if load.load1 > 2.0 { Color::Yellow } else { Color::Green };
             resource_lines.push(Line::from(vec![
-                Span::raw(" Load:     ").dim(),
-                Span::raw(format!("{:.2}", load.load1)).fg(load_color),
-                Span::raw(format!(" {:.2} {:.2}", load.load5, load.load15)).dim(),
-                Span::raw(" (1/5/15m)").fg(Color::DarkGray),
+                Span::styled(" Load:   ", Style::default().dim()),
+                Span::styled(format!("{:.2}", load.load1), Style::default().fg(color)),
+                Span::styled(format!(" {:.2} {:.2} (1/5/15m)", load.load5, load.load15), Style::default().dim()),
             ]));
         }
 
         // CPU info
-        if let Some(cpu) = self.get_node_cpu_info(node_name) {
+        if let Some(cpu) = self.get_node_cpu_info(&version.node) {
             resource_lines.push(Line::from(vec![
-                Span::raw(" CPU:      ").dim(),
-                Span::raw(format!("{} cores", cpu.cpu_count)).fg(Color::White),
-                Span::raw(format!(" @ {:.0} MHz", cpu.mhz)).dim(),
-            ]));
-            // Truncate model name if too long
-            let model = if cpu.model_name.len() > 35 {
-                format!("{}...", &cpu.model_name[..32])
-            } else {
-                cpu.model_name.clone()
-            };
-            resource_lines.push(Line::from(vec![
-                Span::raw("           ").dim(),
-                Span::raw(model).fg(Color::DarkGray),
+                Span::styled(" CPU:    ", Style::default().dim()),
+                Span::styled(format!("{} cores", cpu.cpu_count), Style::default().fg(Color::White)),
+                Span::styled(format!(" @ {:.0}MHz", cpu.mhz), Style::default().dim()),
             ]));
         }
 
-        frame.render_widget(Paragraph::new(resource_lines), detail_layout[1]);
+        frame.render_widget(Paragraph::new(resource_lines), panel_layout[0]);
 
-        // Services list
-        if let Some(services) = self.get_node_services(node_name) {
-            let service_rows: Vec<Row> = services
-                .iter()
-                .enumerate()
-                .map(|(i, svc)| {
-                    let health_symbol = svc
-                        .health
-                        .as_ref()
-                        .map(|h| if h.healthy { "●" } else { "○" })
-                        .unwrap_or("?");
-                    let health_color = match health_symbol {
-                        "●" => Color::Green,
-                        "○" => Color::Red,
-                        _ => Color::DarkGray,
-                    };
+        // Services section
+        if let Some(services) = self.get_node_services(&version.node) {
+            let running = services.iter().filter(|s| s.state == "Running").count();
+            let mut svc_lines = vec![
+                Line::from(vec![
+                    Span::styled(format!(" Services ({}/{})", running, services.len()), Style::default().fg(Color::Gray)),
+                ]),
+            ];
 
-                    let is_selected = i == self.selected_service;
-                    let row_style = if is_selected {
-                        Style::default().bg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                    };
+            for (i, svc) in services.iter().enumerate() {
+                let health_symbol = svc.health.as_ref()
+                    .map(|h| if h.healthy { "●" } else { "○" })
+                    .unwrap_or("●");
+                let health_color = if health_symbol == "●" { Color::Green } else { Color::Red };
 
-                    Row::new(vec![
-                        Span::raw(format!(" {} ", health_symbol)).fg(health_color),
-                        Span::raw(&svc.id).fg(Color::White),
-                        Span::raw(&svc.state).dim(),
-                    ])
-                    .style(row_style)
-                })
-                .collect();
+                // Highlight selected service when services pane is focused
+                let is_selected = i == self.selected_service && self.focused_pane == FocusedPane::Services;
+                let name_style = if is_selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let selector = if is_selected { "▸" } else { " " };
 
-            let services_table = Table::new(
-                service_rows,
-                [
-                    Constraint::Length(3),
-                    Constraint::Min(20),
-                    Constraint::Length(12),
-                ],
-            )
-            .header(
-                Row::new(vec![
-                    Span::raw("").dim(),
-                    Span::raw("Service [Tab]").dim(),
-                    Span::raw("State").dim(),
-                ])
-                .style(Style::default().add_modifier(Modifier::UNDERLINED)),
-            );
+                svc_lines.push(Line::from(vec![
+                    Span::raw(format!(" {}", selector)),
+                    Span::styled(health_symbol, Style::default().fg(health_color)),
+                    Span::raw(" "),
+                    Span::styled(&svc.id, name_style),
+                    Span::styled(format!(" ({})", svc.state), Style::default().dim()),
+                ]));
+            }
 
-            frame.render_widget(services_table, detail_layout[2]);
+            frame.render_widget(Paragraph::new(svc_lines), panel_layout[1]);
         }
     }
 }

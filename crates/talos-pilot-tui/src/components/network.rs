@@ -2350,10 +2350,12 @@ impl NetworkStatsComponent {
         };
 
         // Return action to show logs for this service
+        let service_vec = vec![service_name.to_string()];
         Ok(Some(Action::ShowMultiLogs(
             self.address.clone(),
             "".to_string(), // role not needed for single service
-            vec![service_name.to_string()],
+            service_vec.clone(),
+            service_vec, // from network view we only know about this service
         )))
     }
 

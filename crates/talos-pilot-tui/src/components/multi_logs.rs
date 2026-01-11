@@ -222,16 +222,24 @@ pub struct MultiLogsComponent {
 
 impl MultiLogsComponent {
     /// Create a new multi-logs component
-    pub fn new(node_ip: String, node_role: String, service_ids: Vec<String>) -> Self {
+    /// - active_services: services to initially show logs for
+    /// - all_services: all available services (inactive ones shown greyed out in sidebar)
+    pub fn new(node_ip: String, node_role: String, active_services: Vec<String>, all_services: Vec<String>) -> Self {
+        // Build a set of active service IDs for quick lookup
+        let active_set: std::collections::HashSet<&str> = active_services.iter().map(|s| s.as_str()).collect();
+
         // Assign colors to services deterministically
-        let services: Vec<ServiceState> = service_ids
+        let services: Vec<ServiceState> = all_services
             .into_iter()
             .enumerate()
-            .map(|(i, id)| ServiceState {
-                color: SERVICE_COLORS[i % SERVICE_COLORS.len()],
-                id,
-                active: true, // All active by default
-                entry_count: 0,
+            .map(|(i, id)| {
+                let is_active = active_set.contains(id.as_str());
+                ServiceState {
+                    color: SERVICE_COLORS[i % SERVICE_COLORS.len()],
+                    active: is_active,
+                    id,
+                    entry_count: 0,
+                }
             })
             .collect();
 
@@ -890,10 +898,21 @@ impl MultiLogsComponent {
 
     /// Toggle service active state
     fn toggle_service(&mut self, index: usize) {
-        if let Some(service) = self.services.get_mut(index) {
+        let should_restart_streaming = if let Some(service) = self.services.get_mut(index) {
+            let was_active = service.active;
             service.active = !service.active;
-            self.update_counts(); // Level counts depend on active services
-            self.rebuild_visible_indices();
+            // Check if we need to restart streaming (enabled a service while streaming)
+            !was_active && service.active && self.streaming
+        } else {
+            false
+        };
+
+        self.update_counts(); // Level counts depend on active services
+        self.rebuild_visible_indices();
+
+        // Restart streaming to include the new service
+        if should_restart_streaming {
+            self.start_streaming();
         }
     }
 

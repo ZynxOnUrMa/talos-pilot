@@ -648,20 +648,24 @@ impl Component for EtcdComponent {
                 let node = self.members.first()
                     .map(|m| m.info.hostname.clone())
                     .unwrap_or_else(|| "controlplane".to_string());
+                let etcd_vec = vec!["etcd".to_string()];
                 Ok(Some(Action::ShowMultiLogs(
                     node,
                     "controlplane".to_string(),
-                    vec!["etcd".to_string()],
+                    etcd_vec.clone(),
+                    etcd_vec,
                 )))
             }
             KeyCode::Enter => {
                 // View etcd logs for selected member
                 if let Some(member) = self.selected_member() {
                     let node = member.info.hostname.clone();
+                    let etcd_vec = vec!["etcd".to_string()];
                     Ok(Some(Action::ShowMultiLogs(
                         node,
                         "controlplane".to_string(),
-                        vec!["etcd".to_string()],
+                        etcd_vec.clone(),
+                        etcd_vec,
                     )))
                 } else {
                     Ok(None)

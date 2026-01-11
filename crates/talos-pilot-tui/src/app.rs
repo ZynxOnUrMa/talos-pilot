@@ -423,23 +423,24 @@ impl App {
                     }
                 }
             }
-            Action::ShowMultiLogs(node_ip, node_role, service_ids) => {
+            Action::ShowMultiLogs(node_ip, node_role, active_services, all_services) => {
                 // Switch to multi-service logs view
                 tracing::info!("Viewing multi-service logs for node: {}", node_ip);
 
-                // Create multi-logs component
+                // Create multi-logs component with all services, marking active ones
                 let mut multi_logs = MultiLogsComponent::new(
                     node_ip,
                     node_role,
-                    service_ids.clone(),
+                    active_services.clone(),
+                    all_services,
                 );
 
-                // Fetch logs from all services in parallel and set up client for streaming
+                // Fetch logs from active services and set up client for streaming
                 if let Some(client) = self.cluster.client() {
                     // Set the client for streaming capability
                     multi_logs.set_client(client.clone(), self.tail_lines);
 
-                    let service_refs: Vec<&str> = service_ids.iter().map(|s| s.as_str()).collect();
+                    let service_refs: Vec<&str> = active_services.iter().map(|s| s.as_str()).collect();
                     match client.logs_multi(&service_refs, self.tail_lines).await {
                         Ok(logs) => {
                             multi_logs.set_logs(logs);

@@ -25,8 +25,8 @@ pub enum Action {
     ShowClusterList,
     ShowNodeList(String), // cluster name
     ShowNodeDetails(String, String), // cluster, node
-    /// Show multi-service logs: (node_ip, node_role, service_ids)
-    ShowMultiLogs(String, String, Vec<String>),
+    /// Show multi-service logs: (node_ip, node_role, active_service_ids, all_service_ids)
+    ShowMultiLogs(String, String, Vec<String>, Vec<String>),
     /// Show etcd cluster status
     ShowEtcd,
     /// Show processes for a node: (hostname, address)
