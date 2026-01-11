@@ -7,11 +7,30 @@
 use crate::error::TalosError;
 use std::process::Command;
 
-/// Execute a talosctl command and return stdout
+/// Execute a talosctl command and return stdout (blocking)
 fn exec_talosctl(args: &[&str]) -> Result<String, TalosError> {
     let output = Command::new("talosctl")
         .args(args)
         .output()
+        .map_err(|e| TalosError::Io(e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TalosError::Connection(format!(
+            "talosctl failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Execute a talosctl command asynchronously and return stdout
+async fn exec_talosctl_async(args: &[&str]) -> Result<String, TalosError> {
+    let output = tokio::process::Command::new("talosctl")
+        .args(args)
+        .output()
+        .await
         .map_err(|e| TalosError::Io(e))?;
 
     if !output.status.success() {
@@ -133,6 +152,22 @@ pub fn get_kubespan_peers(node: &str) -> Result<Vec<KubeSpanPeerStatus>, TalosEr
 /// Executes: talosctl get members --nodes <node> -o yaml
 pub fn get_discovery_members(node: &str) -> Result<Vec<DiscoveryMember>, TalosError> {
     let output = exec_talosctl(&["get", "members", "--nodes", node, "-o", "yaml"])?;
+    parse_discovery_members_yaml(&output)
+}
+
+/// Get discovery members for a context (async, non-blocking)
+///
+/// Executes: talosctl --context <context> --nodes 127.0.0.1 get members -o yaml
+///
+/// This version uses the context name to get the correct certificates and endpoint,
+/// and uses tokio async process to avoid blocking the runtime.
+pub async fn get_discovery_members_for_context(context: &str) -> Result<Vec<DiscoveryMember>, TalosError> {
+    let output = exec_talosctl_async(&[
+        "--context", context,
+        "--nodes", "127.0.0.1",
+        "get", "members",
+        "-o", "yaml"
+    ]).await?;
     parse_discovery_members_yaml(&output)
 }
 

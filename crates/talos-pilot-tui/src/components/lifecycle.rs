@@ -18,7 +18,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Instant;
-use talos_rs::{get_discovery_members, DiscoveryMember, NodeTimeInfo, TalosClient, VersionInfo};
+use talos_rs::{get_discovery_members_for_context, DiscoveryMember, NodeTimeInfo, TalosClient, TalosConfig, VersionInfo};
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 30;
@@ -243,13 +243,17 @@ impl LifecycleComponent {
             }
         }
 
-        // Get discovery members via talosctl for first node
-        let first_node = self.versions.first()
-            .map(|v| v.node.split(':').next().unwrap_or(&v.node).to_string());
+        // Fetch discovery members using context-aware async version
+        let context_name = if !self.context_name.is_empty() {
+            self.context_name.clone()
+        } else if let Ok(config) = TalosConfig::load_default() {
+            config.context
+        } else {
+            String::new()
+        };
 
-        // Fetch discovery members
-        if let Some(node) = first_node.clone() {
-            match get_discovery_members(&node) {
+        if !context_name.is_empty() {
+            match get_discovery_members_for_context(&context_name).await {
                 Ok(members) => {
                     self.discovery_members = members;
                 }

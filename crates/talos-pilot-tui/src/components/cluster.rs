@@ -13,8 +13,8 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use talos_rs::{
-    get_address_status, get_discovery_members, DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo,
-    NodeLoadAvg, NodeMemory, NodeServices, ServiceInfo, TalosClient, VersionInfo,
+    get_discovery_members_for_context, DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo,
+    NodeLoadAvg, NodeMemory, NodeServices, ServiceInfo, TalosClient, TalosConfig, VersionInfo,
 };
 
 /// Simple etcd status for header display
@@ -102,24 +102,29 @@ impl NavMenuItem {
 /// Represents a selectable item in the node list (header or node)
 #[derive(Debug, Clone, PartialEq)]
 enum NodeListItem {
-    /// Control plane group header
-    ControlPlaneHeader,
-    /// A control plane node (index into controlplane_nodes)
-    ControlPlaneNode(usize),
-    /// Workers group header
-    WorkersHeader,
-    /// A worker node (index into worker_nodes)
-    WorkerNode(usize),
+    /// Cluster header (cluster_idx)
+    ClusterHeader(usize),
+    /// Control plane group header (cluster_idx)
+    ControlPlaneHeader(usize),
+    /// A control plane node (cluster_idx, node_idx within controlplane_nodes)
+    ControlPlaneNode(usize, usize),
+    /// Workers group header (cluster_idx)
+    WorkersHeader(usize),
+    /// A worker node (cluster_idx, node_idx within worker_nodes)
+    WorkerNode(usize, usize),
 }
 
-/// Cluster component showing overview with node list
-pub struct ClusterComponent {
-    /// Talos client for API calls
+/// Per-cluster data storage
+#[derive(Clone, Default)]
+struct ClusterData {
+    /// Context/cluster name
+    name: String,
+    /// Talos client for this cluster
     client: Option<TalosClient>,
-    /// Context name to use (None = use default context)
-    context: Option<String>,
     /// Connection state
-    state: ConnectionState,
+    connected: bool,
+    /// Error message if connection failed
+    error: Option<String>,
     /// Version info from nodes
     versions: Vec<VersionInfo>,
     /// Services from nodes
@@ -130,26 +135,36 @@ pub struct ClusterComponent {
     load_avg: Vec<NodeLoadAvg>,
     /// CPU info from nodes
     cpu_info: Vec<NodeCpuInfo>,
-    /// Etcd members (control plane nodes only, for etcd status)
+    /// Etcd members (control plane nodes only)
     etcd_members: Vec<EtcdMemberInfo>,
-    /// Discovery members (ALL cluster nodes - control planes and workers)
+    /// Discovery members (ALL cluster nodes)
     discovery_members: Vec<DiscoveryMember>,
     /// Etcd summary for header
     etcd_summary: Option<EtcdSummary>,
-    /// Node hostname to IP mapping (discovered from cluster members)
+    /// Node hostname to IP mapping
     node_ips: HashMap<String, String>,
-    /// Currently selected node index (legacy, kept for compatibility)
-    selected: usize,
+    /// VIP info (if configured)
+    vip_info: Option<VipInfo>,
+    /// Whether this cluster accordion is expanded
+    expanded: bool,
+    /// Whether control plane group is expanded
+    controlplane_expanded: bool,
+    /// Whether workers group is expanded
+    workers_expanded: bool,
+}
+
+/// Cluster component showing overview with node list
+pub struct ClusterComponent {
+    /// All clusters from talosconfig
+    clusters: Vec<ClusterData>,
+    /// Currently active cluster index (for operations)
+    active_cluster: usize,
     /// Currently selected service index within the node
     selected_service: usize,
     /// List state for selection
     list_state: ListState,
-    /// Error message if any
-    error: Option<String>,
     /// Last refresh time
     last_refresh: Option<std::time::Instant>,
-    /// VIP info (if configured)
-    vip_info: Option<VipInfo>,
     /// Which pane is currently focused
     focused_pane: FocusedPane,
     /// Currently selected navigation menu item
@@ -158,22 +173,8 @@ pub struct ClusterComponent {
     auto_refresh: bool,
     /// Last auto-refresh time for selected node
     last_auto_refresh: Option<std::time::Instant>,
-    /// Whether we've attempted to fetch etcd members (to detect not-bootstrapped state)
-    etcd_fetch_attempted: bool,
-    /// Whether control plane group is expanded
-    controlplane_expanded: bool,
-    /// Whether workers group is expanded
-    workers_expanded: bool,
     /// Currently selected item in the node list
     selected_item: NodeListItem,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Error(String),
 }
 
 impl Default for ClusterComponent {
@@ -183,56 +184,46 @@ impl Default for ClusterComponent {
 }
 
 impl ClusterComponent {
-    pub fn new(context: Option<String>) -> Self {
+    pub fn new(_context: Option<String>) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
 
         Self {
-            client: None,
-            context,
-            state: ConnectionState::Disconnected,
-            versions: Vec::new(),
-            services: Vec::new(),
-            memory: Vec::new(),
-            load_avg: Vec::new(),
-            cpu_info: Vec::new(),
-            etcd_members: Vec::new(),
-            discovery_members: Vec::new(),
-            etcd_summary: None,
-            node_ips: HashMap::new(),
-            selected: 0,
+            clusters: Vec::new(),
+            active_cluster: 0,
             selected_service: 0,
             list_state,
-            error: None,
             last_refresh: None,
-            vip_info: None,
             focused_pane: FocusedPane::Nodes,
             selected_menu_item: 0,
             auto_refresh: true,
             last_auto_refresh: None,
-            etcd_fetch_attempted: false,
-            controlplane_expanded: true,
-            workers_expanded: true,
-            selected_item: NodeListItem::ControlPlaneHeader,
+            selected_item: NodeListItem::ClusterHeader(0),
         }
     }
 
-    /// Get control plane nodes (nodes with etcd service)
-    fn controlplane_nodes(&self) -> Vec<(usize, &VersionInfo)> {
-        self.versions.iter().enumerate()
+    /// Get control plane nodes for a cluster (nodes with etcd service)
+    fn controlplane_nodes_for(&self, cluster_idx: usize) -> Vec<(usize, &VersionInfo)> {
+        let Some(cluster) = self.clusters.get(cluster_idx) else {
+            return Vec::new();
+        };
+        cluster.versions.iter().enumerate()
             .filter(|(_, v)| {
-                self.get_node_services(&v.node)
+                self.get_node_services_for(cluster_idx, &v.node)
                     .map(|s| s.iter().any(|svc| svc.id == "etcd"))
                     .unwrap_or(false)
             })
             .collect()
     }
 
-    /// Get worker nodes (nodes without etcd service)
-    fn worker_nodes(&self) -> Vec<(usize, &VersionInfo)> {
-        self.versions.iter().enumerate()
+    /// Get worker nodes for a cluster (nodes without etcd service)
+    fn worker_nodes_for(&self, cluster_idx: usize) -> Vec<(usize, &VersionInfo)> {
+        let Some(cluster) = self.clusters.get(cluster_idx) else {
+            return Vec::new();
+        };
+        cluster.versions.iter().enumerate()
             .filter(|(_, v)| {
-                self.get_node_services(&v.node)
+                self.get_node_services_for(cluster_idx, &v.node)
                     .map(|s| !s.iter().any(|svc| svc.id == "etcd"))
                     .unwrap_or(true)
             })
@@ -242,25 +233,33 @@ impl ClusterComponent {
     /// Build the visible list of items based on expand/collapse state
     fn visible_items(&self) -> Vec<NodeListItem> {
         let mut items = Vec::new();
-        let cp_nodes = self.controlplane_nodes();
-        let worker_nodes = self.worker_nodes();
 
-        // Control plane section
-        if !cp_nodes.is_empty() {
-            items.push(NodeListItem::ControlPlaneHeader);
-            if self.controlplane_expanded {
-                for (i, _) in cp_nodes.iter().enumerate() {
-                    items.push(NodeListItem::ControlPlaneNode(i));
+        for (cluster_idx, cluster) in self.clusters.iter().enumerate() {
+            // Cluster header
+            items.push(NodeListItem::ClusterHeader(cluster_idx));
+
+            if cluster.expanded {
+                let cp_nodes = self.controlplane_nodes_for(cluster_idx);
+                let worker_nodes = self.worker_nodes_for(cluster_idx);
+
+                // Control plane section
+                if !cp_nodes.is_empty() {
+                    items.push(NodeListItem::ControlPlaneHeader(cluster_idx));
+                    if cluster.controlplane_expanded {
+                        for (i, _) in cp_nodes.iter().enumerate() {
+                            items.push(NodeListItem::ControlPlaneNode(cluster_idx, i));
+                        }
+                    }
                 }
-            }
-        }
 
-        // Workers section
-        if !worker_nodes.is_empty() {
-            items.push(NodeListItem::WorkersHeader);
-            if self.workers_expanded {
-                for (i, _) in worker_nodes.iter().enumerate() {
-                    items.push(NodeListItem::WorkerNode(i));
+                // Workers section
+                if !worker_nodes.is_empty() {
+                    items.push(NodeListItem::WorkersHeader(cluster_idx));
+                    if cluster.workers_expanded {
+                        for (i, _) in worker_nodes.iter().enumerate() {
+                            items.push(NodeListItem::WorkerNode(cluster_idx, i));
+                        }
+                    }
                 }
             }
         }
@@ -268,16 +267,14 @@ impl ClusterComponent {
         items
     }
 
-    /// Get the actual version index for the currently selected node
-    fn selected_version_index(&self) -> Option<usize> {
+    /// Get the cluster index for the currently selected item
+    fn selected_cluster_index(&self) -> Option<usize> {
         match &self.selected_item {
-            NodeListItem::ControlPlaneNode(idx) => {
-                self.controlplane_nodes().get(*idx).map(|(i, _)| *i)
-            }
-            NodeListItem::WorkerNode(idx) => {
-                self.worker_nodes().get(*idx).map(|(i, _)| *i)
-            }
-            _ => None, // Headers don't have a version index
+            NodeListItem::ClusterHeader(idx) => Some(*idx),
+            NodeListItem::ControlPlaneHeader(idx) => Some(*idx),
+            NodeListItem::ControlPlaneNode(idx, _) => Some(*idx),
+            NodeListItem::WorkersHeader(idx) => Some(*idx),
+            NodeListItem::WorkerNode(idx, _) => Some(*idx),
         }
     }
 
@@ -290,9 +287,9 @@ impl ClusterComponent {
         let current_pos = items.iter().position(|i| i == &self.selected_item).unwrap_or(0);
         let next_pos = (current_pos + 1).min(items.len() - 1);
         self.selected_item = items[next_pos].clone();
-        // Update legacy selected index
-        if let Some(idx) = self.selected_version_index() {
-            self.selected = idx;
+        // Update active cluster
+        if let Some(idx) = self.selected_cluster_index() {
+            self.active_cluster = idx;
         }
     }
 
@@ -305,296 +302,249 @@ impl ClusterComponent {
         let current_pos = items.iter().position(|i| i == &self.selected_item).unwrap_or(0);
         let prev_pos = current_pos.saturating_sub(1);
         self.selected_item = items[prev_pos].clone();
-        // Update legacy selected index
-        if let Some(idx) = self.selected_version_index() {
-            self.selected = idx;
+        // Update active cluster
+        if let Some(idx) = self.selected_cluster_index() {
+            self.active_cluster = idx;
         }
     }
 
     /// Toggle expand/collapse of the currently selected group header
     fn toggle_expand(&mut self) {
         match &self.selected_item {
-            NodeListItem::ControlPlaneHeader => {
-                self.controlplane_expanded = !self.controlplane_expanded;
+            NodeListItem::ClusterHeader(idx) => {
+                if let Some(cluster) = self.clusters.get_mut(*idx) {
+                    cluster.expanded = !cluster.expanded;
+                }
             }
-            NodeListItem::WorkersHeader => {
-                self.workers_expanded = !self.workers_expanded;
+            NodeListItem::ControlPlaneHeader(idx) => {
+                if let Some(cluster) = self.clusters.get_mut(*idx) {
+                    cluster.controlplane_expanded = !cluster.controlplane_expanded;
+                }
+            }
+            NodeListItem::WorkersHeader(idx) => {
+                if let Some(cluster) = self.clusters.get_mut(*idx) {
+                    cluster.workers_expanded = !cluster.workers_expanded;
+                }
             }
             _ => {} // No action for node items
         }
     }
 
-    /// Initialize connection to Talos cluster
+    /// Initialize connection to all Talos clusters from talosconfig
     pub async fn connect(&mut self) -> Result<()> {
-        self.state = ConnectionState::Connecting;
-
         // Install crypto provider (needed for rustls)
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Use named context if specified, otherwise default
-        let client_result = match &self.context {
-            Some(ctx_name) => TalosClient::from_named_context(ctx_name).await,
-            None => TalosClient::from_default_config().await,
+        // Load talosconfig to get all contexts
+        let config = match TalosConfig::load_default() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to load talosconfig: {}", e);
+                return Ok(());
+            }
         };
 
-        match client_result {
-            Ok(client) => {
-                self.client = Some(client);
-                self.state = ConnectionState::Connected;
-                self.refresh().await?;
+        // Get all context names
+        let context_names: Vec<String> = config.contexts.keys().cloned().collect();
+
+        // Create ClusterData for each context
+        self.clusters.clear();
+        for (idx, name) in context_names.iter().enumerate() {
+            let mut cluster = ClusterData {
+                name: name.clone(),
+                expanded: idx == 0, // Expand first cluster by default
+                controlplane_expanded: true,
+                workers_expanded: true,
+                ..Default::default()
+            };
+
+            // Try to connect to each cluster
+            match TalosClient::from_named_context(name).await {
+                Ok(client) => {
+                    cluster.client = Some(client);
+                    cluster.connected = true;
+                }
+                Err(e) => {
+                    cluster.error = Some(e.to_string());
+                    cluster.connected = false;
+                }
             }
-            Err(e) => {
-                self.state = ConnectionState::Error(e.to_string());
-                self.error = Some(e.to_string());
-            }
+
+            self.clusters.push(cluster);
+        }
+
+        // Refresh all connected clusters
+        self.refresh().await?;
+
+        // Set initial selection
+        if !self.clusters.is_empty() {
+            self.selected_item = NodeListItem::ClusterHeader(0);
+            self.active_cluster = 0;
         }
 
         Ok(())
     }
 
-    /// Refresh cluster data from API
+    /// Refresh all cluster data
     pub async fn refresh(&mut self) -> Result<()> {
-        if let Some(client) = &self.client {
-            // First, fetch etcd members via gRPC (for etcd status and as initial endpoint)
-            match client.etcd_members().await {
-                Ok(members) => {
-                    // Add etcd members to node_ips
-                    self.node_ips.clear();
-                    for member in &members {
-                        if let Some(ip) = member.ip_address() {
-                            self.node_ips.insert(member.hostname.clone(), ip);
-                        }
+        // Refresh each cluster
+        for cluster_idx in 0..self.clusters.len() {
+            self.refresh_cluster(cluster_idx).await;
+        }
+        self.last_refresh = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Refresh a single cluster's data
+    async fn refresh_cluster(&mut self, cluster_idx: usize) {
+        let Some(cluster) = self.clusters.get_mut(cluster_idx) else {
+            return;
+        };
+
+        let Some(client) = &cluster.client else {
+            return;
+        };
+
+        // Clone client to avoid borrow issues
+        let client = client.clone();
+
+        // First, fetch etcd members via gRPC
+        match client.etcd_members().await {
+            Ok(members) => {
+                cluster.node_ips.clear();
+                for member in &members {
+                    if let Some(ip) = member.ip_address() {
+                        cluster.node_ips.insert(member.hostname.clone(), ip);
                     }
-                    self.etcd_members = members;
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch etcd members: {}", e);
-                    self.etcd_members.clear();
-                }
+                cluster.etcd_members = members;
             }
-            self.etcd_fetch_attempted = true;
-
-            // Now try to get discovery members (ALL nodes including workers)
-            // This requires talosctl and uses the cluster discovery service
-            // Use the first etcd member IP to query
-            if let Some(first_member) = self.etcd_members.first() {
-                if let Some(endpoint_ip) = first_member.ip_address() {
-                    match get_discovery_members(&endpoint_ip) {
-                        Ok(members) => {
-                            // Build hostname -> IP mapping from ALL members
-                            self.node_ips.clear();
-                            for member in &members {
-                                if let Some(ip) = member.addresses.first() {
-                                    self.node_ips.insert(member.hostname.clone(), ip.clone());
-                                }
-                            }
-                            self.discovery_members = members;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch discovery members: {}", e);
-                            self.discovery_members.clear();
-                        }
-                    }
-                }
+            Err(e) => {
+                tracing::warn!("Failed to fetch etcd members for {}: {}", cluster.name, e);
+                cluster.etcd_members.clear();
             }
-
-            // Determine which nodes to query - prefer discovery_members (includes workers)
-            // Fall back to etcd_members if discovery is empty
-            let nodes_to_query: Vec<(String, String)> = if !self.discovery_members.is_empty() {
-                self.discovery_members.iter()
-                    .filter_map(|m| {
-                        m.addresses.first().map(|ip| {
-                            let name = if !m.hostname.is_empty() {
-                                m.hostname.clone()
-                            } else {
-                                ip.clone()
-                            };
-                            (name, ip.clone())
-                        })
-                    })
-                    .collect()
-            } else if !self.etcd_members.is_empty() {
-                self.etcd_members.iter()
-                    .filter_map(|m| {
-                        m.ip_address().map(|ip| {
-                            let name = if !m.hostname.is_empty() {
-                                m.hostname.clone()
-                            } else {
-                                ip.clone()
-                            };
-                            (name, ip)
-                        })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            // If we have discovered nodes, query each one
-            if !nodes_to_query.is_empty() {
-                let mut versions = Vec::new();
-                let mut services = Vec::new();
-                let mut memory = Vec::new();
-                let mut load_avg = Vec::new();
-                let mut cpu_info = Vec::new();
-
-                for (node_name, ip) in &nodes_to_query {
-                    let node_client = client.with_node(ip);
-
-                    // Version
-                    if let Ok(mut node_versions) = node_client.version().await {
-                        for v in &mut node_versions {
-                            v.node = node_name.clone();
-                        }
-                        versions.extend(node_versions);
-                    }
-
-                    // Services
-                    if let Ok(mut node_services) = node_client.services().await {
-                        for s in &mut node_services {
-                            s.node = node_name.clone();
-                        }
-                        services.extend(node_services);
-                    }
-
-                    // Memory
-                    if let Ok(mut node_memory) = node_client.memory().await {
-                        for m in &mut node_memory {
-                            m.node = node_name.clone();
-                        }
-                        memory.extend(node_memory);
-                    }
-
-                    // Load average
-                    if let Ok(mut node_load) = node_client.load_avg().await {
-                        for l in &mut node_load {
-                            l.node = node_name.clone();
-                        }
-                        load_avg.extend(node_load);
-                    }
-
-                    // CPU info
-                    if let Ok(mut node_cpu) = node_client.cpu_info().await {
-                        for c in &mut node_cpu {
-                            c.node = node_name.clone();
-                        }
-                        cpu_info.extend(node_cpu);
-                    }
-                }
-
-                if !versions.is_empty() {
-                    self.versions = versions;
-                }
-                if !services.is_empty() {
-                    self.services = services;
-                }
-                if !memory.is_empty() {
-                    self.memory = memory;
-                }
-                if !load_avg.is_empty() {
-                    self.load_avg = load_avg;
-                }
-                if !cpu_info.is_empty() {
-                    self.cpu_info = cpu_info;
-                }
-            } else {
-                // Fallback: fetch without targeting (may have empty hostnames)
-                match client.version().await {
-                    Ok(versions) => self.versions = versions,
-                    Err(e) => self.error = Some(format!("Version error: {}", e)),
-                }
-
-                match client.services().await {
-                    Ok(services) => self.services = services,
-                    Err(e) => self.error = Some(format!("Services error: {}", e)),
-                }
-
-                match client.memory().await {
-                    Ok(memory) => self.memory = memory,
-                    Err(e) => self.error = Some(format!("Memory error: {}", e)),
-                }
-
-                match client.load_avg().await {
-                    Ok(load_avg) => self.load_avg = load_avg,
-                    Err(e) => self.error = Some(format!("LoadAvg error: {}", e)),
-                }
-
-                match client.cpu_info().await {
-                    Ok(cpu_info) => self.cpu_info = cpu_info,
-                    Err(e) => self.error = Some(format!("CPUInfo error: {}", e)),
-                }
-            }
-
-            // Fetch etcd status for header summary
-            match client.etcd_status().await {
-                Ok(statuses) => {
-                    let total = self.etcd_members.len();
-                    let healthy = statuses.len();
-                    let quorum_needed = total / 2 + 1;
-                    self.etcd_summary = Some(EtcdSummary {
-                        healthy,
-                        total,
-                        has_quorum: healthy >= quorum_needed,
-                    });
-                }
-                Err(_) => {
-                    // Don't overwrite existing summary on error
-                }
-            }
-
-            // Check for VIP (Virtual IP) - look for addresses with vip flag
-            self.vip_info = None;
-            for member in &self.etcd_members {
-                if let Some(ip) = member.ip_address() {
-                    // Use talosctl to get address status
-                    match get_address_status(&ip) {
-                        Ok(addresses) => {
-                            // Look for addresses with "vip" flag or on a shared interface
-                            for addr in addresses {
-                                if addr.flags.iter().any(|f| f.to_lowercase().contains("vip"))
-                                    || addr.link_name.contains("vip")
-                                {
-                                    let holder = if !member.hostname.is_empty() {
-                                        member.hostname.clone()
-                                    } else {
-                                        ip.clone()
-                                    };
-                                    self.vip_info = Some(VipInfo {
-                                        address: addr.address.clone(),
-                                        holder,
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // Silently ignore VIP detection errors
-                        }
-                    }
-                    if self.vip_info.is_some() {
-                        break;
-                    }
-                }
-            }
-
-            self.last_refresh = Some(std::time::Instant::now());
         }
 
-        Ok(())
+        // Try to get discovery members (ALL nodes including workers)
+        // Use context-aware async function to avoid blocking and to use correct certificates
+        let context_name = cluster.name.clone();
+        match get_discovery_members_for_context(&context_name).await {
+            Ok(members) => {
+                cluster.node_ips.clear();
+                for member in &members {
+                    if let Some(ip) = member.addresses.first() {
+                        cluster.node_ips.insert(member.hostname.clone(), ip.clone());
+                    }
+                }
+                cluster.discovery_members = members;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch discovery members for {}: {}", cluster.name, e);
+                cluster.discovery_members.clear();
+            }
+        }
+
+        // Determine which nodes to query
+        let nodes_to_query: Vec<(String, String)> = if !cluster.discovery_members.is_empty() {
+            cluster.discovery_members.iter()
+                .filter_map(|m| {
+                    m.addresses.first().map(|ip| {
+                        let name = if !m.hostname.is_empty() { m.hostname.clone() } else { ip.clone() };
+                        (name, ip.clone())
+                    })
+                })
+                .collect()
+        } else if !cluster.etcd_members.is_empty() {
+            cluster.etcd_members.iter()
+                .filter_map(|m| {
+                    m.ip_address().map(|ip| {
+                        let name = if !m.hostname.is_empty() { m.hostname.clone() } else { ip.clone() };
+                        (name, ip)
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Query each node
+        if !nodes_to_query.is_empty() {
+            let mut versions = Vec::new();
+            let mut services = Vec::new();
+            let mut memory = Vec::new();
+            let mut load_avg = Vec::new();
+            let mut cpu_info = Vec::new();
+
+            for (node_name, ip) in &nodes_to_query {
+                let node_client = client.with_node(ip);
+
+                if let Ok(mut nv) = node_client.version().await {
+                    for v in &mut nv { v.node = node_name.clone(); }
+                    versions.extend(nv);
+                }
+                if let Ok(mut ns) = node_client.services().await {
+                    for s in &mut ns { s.node = node_name.clone(); }
+                    services.extend(ns);
+                }
+                if let Ok(mut nm) = node_client.memory().await {
+                    for m in &mut nm { m.node = node_name.clone(); }
+                    memory.extend(nm);
+                }
+                if let Ok(mut nl) = node_client.load_avg().await {
+                    for l in &mut nl { l.node = node_name.clone(); }
+                    load_avg.extend(nl);
+                }
+                if let Ok(mut nc) = node_client.cpu_info().await {
+                    for c in &mut nc { c.node = node_name.clone(); }
+                    cpu_info.extend(nc);
+                }
+            }
+
+            // Need to re-borrow cluster mutably after async calls
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.versions = versions;
+                cluster.services = services;
+                cluster.memory = memory;
+                cluster.load_avg = load_avg;
+                cluster.cpu_info = cpu_info;
+
+                // Fetch etcd status for header summary
+                if let Some(client) = &cluster.client {
+                    if let Ok(statuses) = client.etcd_status().await {
+                        let total = cluster.etcd_members.len();
+                        let healthy = statuses.len();
+                        let quorum_needed = total / 2 + 1;
+                        cluster.etcd_summary = Some(EtcdSummary {
+                            healthy,
+                            total,
+                            has_quorum: healthy >= quorum_needed,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Refresh only the selected node's stats (memory, load, services)
     /// This is lighter weight than a full refresh
     pub async fn refresh_selected_node(&mut self) -> Result<()> {
-        let Some(client) = &self.client else {
+        let cluster_idx = self.active_cluster;
+        let Some(cluster) = self.clusters.get(cluster_idx) else {
             return Ok(());
         };
+        let Some(client) = &cluster.client else {
+            return Ok(());
+        };
+        let client = client.clone();
 
         // Get the selected node's name and IP
         let Some(node_name) = self.current_node_name() else {
             return Ok(());
         };
-        let Some(node_ip) = self.node_ips.get(&node_name).cloned() else {
+        let Some(cluster) = self.clusters.get(cluster_idx) else {
+            return Ok(());
+        };
+        let Some(node_ip) = cluster.node_ips.get(&node_name).cloned() else {
             return Ok(());
         };
 
@@ -606,24 +556,30 @@ impl ClusterComponent {
                 s.node = node_name.clone();
             }
             // Update the services for this node
-            self.services.retain(|s| s.node != node_name);
-            self.services.extend(node_services);
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.services.retain(|s| s.node != node_name);
+                cluster.services.extend(node_services);
+            }
         }
 
         if let Ok(mut node_memory) = node_client.memory().await {
             for m in &mut node_memory {
                 m.node = node_name.clone();
             }
-            self.memory.retain(|m| m.node != node_name);
-            self.memory.extend(node_memory);
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.memory.retain(|m| m.node != node_name);
+                cluster.memory.extend(node_memory);
+            }
         }
 
         if let Ok(mut node_load) = node_client.load_avg().await {
             for l in &mut node_load {
                 l.node = node_name.clone();
             }
-            self.load_avg.retain(|l| l.node != node_name);
-            self.load_avg.extend(node_load);
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.load_avg.retain(|l| l.node != node_name);
+                cluster.load_avg.extend(node_load);
+            }
         }
 
         self.last_auto_refresh = Some(std::time::Instant::now());
@@ -641,34 +597,58 @@ impl ClusterComponent {
         }
     }
 
-    /// Get services for a node
-    fn get_node_services(&self, node_name: &str) -> Option<&Vec<ServiceInfo>> {
-        self.services
+    /// Get services for a node in a specific cluster
+    fn get_node_services_for(&self, cluster_idx: usize, node_name: &str) -> Option<&Vec<ServiceInfo>> {
+        self.clusters.get(cluster_idx)?
+            .services
             .iter()
             .find(|s| s.node == node_name || (s.node.is_empty() && node_name.is_empty()))
             .map(|s| &s.services)
     }
 
-    /// Get memory for a node
-    fn get_node_memory(&self, node_name: &str) -> Option<&MemInfo> {
-        self.memory
+    /// Get services for a node in the active cluster
+    fn get_node_services(&self, node_name: &str) -> Option<&Vec<ServiceInfo>> {
+        self.get_node_services_for(self.active_cluster, node_name)
+    }
+
+    /// Get memory for a node in a specific cluster
+    fn get_node_memory_for(&self, cluster_idx: usize, node_name: &str) -> Option<&MemInfo> {
+        self.clusters.get(cluster_idx)?
+            .memory
             .iter()
             .find(|m| m.node == node_name || (m.node.is_empty() && node_name.is_empty()))
             .and_then(|m| m.meminfo.as_ref())
     }
 
-    /// Get load average for a node
-    fn get_node_load_avg(&self, node_name: &str) -> Option<&NodeLoadAvg> {
-        self.load_avg
+    /// Get memory for a node in the active cluster
+    fn get_node_memory(&self, node_name: &str) -> Option<&MemInfo> {
+        self.get_node_memory_for(self.active_cluster, node_name)
+    }
+
+    /// Get load average for a node in a specific cluster
+    fn get_node_load_avg_for(&self, cluster_idx: usize, node_name: &str) -> Option<&NodeLoadAvg> {
+        self.clusters.get(cluster_idx)?
+            .load_avg
             .iter()
             .find(|l| l.node == node_name || (l.node.is_empty() && node_name.is_empty()))
     }
 
-    /// Get CPU info for a node
-    fn get_node_cpu_info(&self, node_name: &str) -> Option<&NodeCpuInfo> {
-        self.cpu_info
+    /// Get load average for a node in the active cluster
+    fn get_node_load_avg(&self, node_name: &str) -> Option<&NodeLoadAvg> {
+        self.get_node_load_avg_for(self.active_cluster, node_name)
+    }
+
+    /// Get CPU info for a node in a specific cluster
+    fn get_node_cpu_info_for(&self, cluster_idx: usize, node_name: &str) -> Option<&NodeCpuInfo> {
+        self.clusters.get(cluster_idx)?
+            .cpu_info
             .iter()
             .find(|c| c.node == node_name || (c.node.is_empty() && node_name.is_empty()))
+    }
+
+    /// Get CPU info for a node in the active cluster
+    fn get_node_cpu_info(&self, node_name: &str) -> Option<&NodeCpuInfo> {
+        self.get_node_cpu_info_for(self.active_cluster, node_name)
     }
 
     /// Get the currently selected service ID
@@ -679,9 +659,17 @@ impl ClusterComponent {
             .map(|s| s.id.clone())
     }
 
-    /// Get a reference to the client for async operations
+    /// Get a reference to the client for the active cluster
     pub fn client(&self) -> Option<&TalosClient> {
-        self.client.as_ref()
+        self.clusters.get(self.active_cluster)?.client.as_ref()
+    }
+
+    /// Get node_ips for active cluster
+    fn node_ips(&self) -> &HashMap<String, String> {
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        self.clusters.get(self.active_cluster)
+            .map(|c| &c.node_ips)
+            .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
     }
 
     /// Get service count for current node
@@ -707,11 +695,11 @@ impl ClusterComponent {
     /// Get current node IP/name based on selected_item
     fn current_node_name(&self) -> Option<String> {
         match &self.selected_item {
-            NodeListItem::ControlPlaneNode(idx) => {
-                self.controlplane_nodes().get(*idx).map(|(_, v)| v.node.clone())
+            NodeListItem::ControlPlaneNode(cluster_idx, node_idx) => {
+                self.controlplane_nodes_for(*cluster_idx).get(*node_idx).map(|(_, v)| v.node.clone())
             }
-            NodeListItem::WorkerNode(idx) => {
-                self.worker_nodes().get(*idx).map(|(_, v)| v.node.clone())
+            NodeListItem::WorkerNode(cluster_idx, node_idx) => {
+                self.worker_nodes_for(*cluster_idx).get(*node_idx).map(|(_, v)| v.node.clone())
             }
             _ => None, // Headers don't have a node name
         }
@@ -751,7 +739,7 @@ impl ClusterComponent {
             NavMenuItem::Etcd => Ok(Some(Action::ShowEtcd)),
             NavMenuItem::Network => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
                 } else {
                     Ok(None)
@@ -759,7 +747,7 @@ impl ClusterComponent {
             }
             NavMenuItem::Processes => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowProcesses(node_name, node_ip)))
                 } else {
                     Ok(None)
@@ -767,7 +755,7 @@ impl ClusterComponent {
             }
             NavMenuItem::Diagnostics => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     let node_role = self.current_node_role();
                     Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
                 } else {
@@ -869,7 +857,7 @@ impl Component for ClusterComponent {
                         // On a header - toggle expand/collapse
                         // On a node - show all logs for that node
                         match &self.selected_item {
-                            NodeListItem::ControlPlaneHeader | NodeListItem::WorkersHeader => {
+                            NodeListItem::ClusterHeader(_) | NodeListItem::ControlPlaneHeader(_) | NodeListItem::WorkersHeader(_) => {
                                 self.toggle_expand();
                                 Ok(None)
                             }
@@ -928,7 +916,7 @@ impl Component for ClusterComponent {
             KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
             KeyCode::Char('p') => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowProcesses(node_name, node_ip)))
                 } else {
                     Ok(None)
@@ -936,7 +924,7 @@ impl Component for ClusterComponent {
             }
             KeyCode::Char('n') => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
                 } else {
                     Ok(None)
@@ -944,7 +932,7 @@ impl Component for ClusterComponent {
             }
             KeyCode::Char('d') => {
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or(node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     let node_role = self.current_node_role();
                     Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
                 } else {
@@ -957,7 +945,7 @@ impl Component for ClusterComponent {
             KeyCode::Char('o') => {
                 // Show node operations overlay for selected node
                 if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or_else(|| node_name.clone());
+                    let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or_else(|| node_name.clone());
                     let is_controlplane = self.current_node_role() == "controlplane";
                     Ok(Some(Action::ShowNodeOperations(node_name, node_ip, is_controlplane)))
                 } else {
@@ -965,19 +953,23 @@ impl Component for ClusterComponent {
                 }
             }
             KeyCode::Char('O') => {
-                // Show rolling operations overlay with all nodes
-                let nodes: Vec<(String, String, bool)> = self.versions.iter()
-                    .enumerate()
-                    .map(|(idx, v)| {
-                        let hostname = v.node.clone();
-                        let ip = self.node_ips.get(&hostname).cloned().unwrap_or_else(|| hostname.clone());
-                        // Check if node has etcd service (controlplane)
-                        let is_controlplane = self.services.get(idx)
-                            .map(|s| s.services.iter().any(|svc| svc.id == "etcd"))
-                            .unwrap_or(false);
-                        (hostname, ip, is_controlplane)
-                    })
-                    .collect();
+                // Show rolling operations overlay with all nodes from active cluster
+                let cluster_idx = self.active_cluster;
+                let nodes: Vec<(String, String, bool)> = if let Some(cluster) = self.clusters.get(cluster_idx) {
+                    cluster.versions.iter()
+                        .map(|v| {
+                            let hostname = v.node.clone();
+                            let ip = cluster.node_ips.get(&hostname).cloned().unwrap_or_else(|| hostname.clone());
+                            // Check if node has etcd service (controlplane)
+                            let is_controlplane = self.get_node_services_for(cluster_idx, &hostname)
+                                .map(|s| s.iter().any(|svc| svc.id == "etcd"))
+                                .unwrap_or(false);
+                            (hostname, ip, is_controlplane)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if !nodes.is_empty() {
                     Ok(Some(Action::ShowRollingOperations(nodes)))
                 } else {
@@ -1072,69 +1064,45 @@ impl Component for ClusterComponent {
 impl ClusterComponent {
     /// Draw compact header with status indicators
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let status_indicator = match &self.state {
-            ConnectionState::Connected => Span::styled(" ● ", Style::default().fg(Color::Green)),
-            ConnectionState::Connecting => Span::styled(" ◐ ", Style::default().fg(Color::Yellow)),
-            ConnectionState::Disconnected => Span::styled(" ○ ", Style::default().fg(Color::DarkGray)),
-            ConnectionState::Error(_) => Span::styled(" ✗ ", Style::default().fg(Color::Red)),
+        // Count connected clusters
+        let connected_count = self.clusters.iter().filter(|c| c.connected).count();
+        let total_count = self.clusters.len();
+
+        let (status_indicator, status_text) = if connected_count == total_count && total_count > 0 {
+            (Span::styled(" ● ", Style::default().fg(Color::Green)), "Connected")
+        } else if connected_count > 0 {
+            (Span::styled(" ◐ ", Style::default().fg(Color::Yellow)), "Partial")
+        } else if total_count == 0 {
+            (Span::styled(" ○ ", Style::default().fg(Color::DarkGray)), "No clusters")
+        } else {
+            (Span::styled(" ✗ ", Style::default().fg(Color::Red)), "Disconnected")
         };
 
-        let status_text = match &self.state {
-            ConnectionState::Connected => "Connected",
-            ConnectionState::Connecting => "Connecting...",
-            ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::Error(e) => e.as_str(),
-        };
 
-        // Build etcd status
-        let etcd_spans = if let Some(etcd) = &self.etcd_summary {
-            let (indicator, color) = if etcd.has_quorum && etcd.healthy == etcd.total {
-                ("●", Color::Green)
-            } else if etcd.has_quorum {
-                ("◐", Color::Yellow)
-            } else {
-                ("✗", Color::Red)
-            };
-            vec![
-                Span::raw("   etcd "),
-                Span::styled(format!("{}/{} ", etcd.healthy, etcd.total), Style::default().fg(color)),
-                Span::styled(indicator, Style::default().fg(color)),
-            ]
-        } else if self.etcd_fetch_attempted && self.etcd_members.is_empty() {
-            // Cluster is not bootstrapped (we tried to fetch etcd but got nothing)
+        // Cluster count
+        let cluster_count_span = if total_count > 1 {
             vec![
                 Span::raw("   "),
-                Span::styled("Not Bootstrapped", Style::default().fg(Color::Yellow)),
-                Span::styled(" ○", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{} clusters", total_count), Style::default().fg(Color::DarkGray)),
             ]
         } else {
             vec![]
         };
-
-        // Build VIP status
-        let vip_spans = if let Some(vip) = &self.vip_info {
-            vec![
-                Span::raw("   VIP "),
-                Span::styled(&vip.address, Style::default().fg(Color::Cyan)),
-            ]
-        } else {
-            vec![]
-        };
-
-        // Context name (use first node's hostname prefix or "cluster")
-        let context_name = self.context.clone().unwrap_or_else(|| "cluster".to_string());
 
         let mut header_spans = vec![
             Span::styled(" talos-pilot ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             status_indicator,
             Span::styled(status_text, Style::default().dim()),
         ];
-        header_spans.extend(etcd_spans);
-        header_spans.extend(vip_spans);
+        header_spans.extend(cluster_count_span);
 
-        // Right-align context name
+        // Active cluster name on the right
+        let active_name = self.clusters.get(self.active_cluster)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "none".to_string());
+
         let left_content = Line::from(header_spans);
-        let right_content = Span::styled(format!(" {} ", context_name), Style::default().fg(Color::DarkGray));
+        let right_content = Span::styled(format!(" {} ", active_name), Style::default().fg(Color::DarkGray));
 
         // Render header
         let header_block = Block::default()
@@ -1145,11 +1113,11 @@ impl ClusterComponent {
         frame.render_widget(header_block, area);
         frame.render_widget(Paragraph::new(left_content), inner);
 
-        // Right-align context
+        // Right-align active cluster name
         let right_area = Rect {
-            x: area.x + area.width.saturating_sub(context_name.len() as u16 + 3),
+            x: area.x + area.width.saturating_sub(active_name.len() as u16 + 3),
             y: area.y,
-            width: context_name.len() as u16 + 3,
+            width: active_name.len() as u16 + 3,
             height: 1,
         };
         frame.render_widget(Paragraph::new(right_content), right_area);
@@ -1181,107 +1149,162 @@ impl ClusterComponent {
         ])
         .split(inner);
 
-        if self.versions.is_empty() {
+        if self.clusters.is_empty() {
             let msg = Paragraph::new(Line::from(Span::styled(
-                "  No nodes connected",
+                "  No clusters found",
                 Style::default().dim(),
             )));
             frame.render_widget(msg, pane_layout[0]);
         } else {
-            // Build accordion-style node list with group headers
+            // Build multi-cluster accordion-style node list
             let mut lines = Vec::new();
-            let cp_nodes = self.controlplane_nodes();
-            let worker_nodes = self.worker_nodes();
             let nodes_focused = self.focused_pane == FocusedPane::Nodes;
 
-            // Control Plane section
-            if !cp_nodes.is_empty() {
-                let is_selected = self.selected_item == NodeListItem::ControlPlaneHeader;
-                let expand_icon = if self.controlplane_expanded { "▼" } else { "▶" };
-                let selector = if is_selected && nodes_focused { "▸" } else { " " };
-                let header_style = if is_selected {
+            for (cluster_idx, cluster) in self.clusters.iter().enumerate() {
+                // Cluster header
+                let is_cluster_selected = self.selected_item == NodeListItem::ClusterHeader(cluster_idx);
+                let expand_icon = if cluster.expanded { "▼" } else { "▶" };
+                let selector = if is_cluster_selected && nodes_focused { "▸" } else { " " };
+
+                // Status indicator
+                let status_symbol = if cluster.connected { "●" } else { "○" };
+                let status_color = if cluster.connected { Color::Green } else { Color::Red };
+
+                let header_style = if is_cluster_selected {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Blue)
+                    Style::default().fg(Color::Magenta)
                 };
 
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {} {} ", selector, expand_icon), header_style),
-                    Span::styled(format!("Control Plane ({})", cp_nodes.len()), header_style),
-                ]));
+                let node_count = cluster.versions.len();
 
-                // Show control plane nodes if expanded
-                if self.controlplane_expanded {
-                    for (idx, (_, v)) in cp_nodes.iter().enumerate() {
-                        let node_name = if v.node.is_empty() { "node".to_string() } else { v.node.clone() };
-                        let is_node_selected = self.selected_item == NodeListItem::ControlPlaneNode(idx);
+                // Build etcd status for this cluster
+                let etcd_spans: Vec<Span> = if let Some(etcd) = &cluster.etcd_summary {
+                    let (indicator, color) = if etcd.has_quorum && etcd.healthy == etcd.total {
+                        ("●", Color::Green)
+                    } else if etcd.has_quorum {
+                        ("◐", Color::Yellow)
+                    } else {
+                        ("✗", Color::Red)
+                    };
+                    vec![
+                        Span::styled("  etcd ", Style::default().dim()),
+                        Span::styled(format!("{}/{}", etcd.healthy, etcd.total), Style::default().fg(color)),
+                        Span::styled(indicator, Style::default().fg(color)),
+                    ]
+                } else {
+                    vec![]
+                };
 
-                        // Health indicator
-                        let mem_pct = self.get_node_memory(&v.node).map(|m| m.usage_percent()).unwrap_or(0.0);
-                        let svc_healthy = self.get_node_services(&v.node)
-                            .map(|services| services.iter().all(|s| s.health.as_ref().map(|h| h.healthy).unwrap_or(true)))
-                            .unwrap_or(true);
-                        let health_symbol = if svc_healthy && mem_pct < 90.0 { "●" } else { "◐" };
-                        let health_color = if svc_healthy && mem_pct < 90.0 { Color::Green } else { Color::Yellow };
+                let mut cluster_line = vec![
+                    Span::styled(format!("{} {} ", selector, expand_icon), header_style),
+                    Span::styled(status_symbol, Style::default().fg(status_color)),
+                    Span::raw(" "),
+                    Span::styled(&cluster.name, header_style),
+                    Span::styled(format!(" ({})", node_count), Style::default().dim()),
+                ];
+                cluster_line.extend(etcd_spans);
+                lines.push(Line::from(cluster_line));
 
-                        let selector = if is_node_selected && nodes_focused { "▸" } else { " " };
-                        let name_style = if is_node_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
+                // Skip if cluster is collapsed
+                if !cluster.expanded {
+                    continue;
+                }
 
-                        lines.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(format!("{} {} ", selector, health_symbol), Style::default().fg(health_color)),
-                            Span::styled(node_name, name_style),
-                        ]));
+                let cp_nodes = self.controlplane_nodes_for(cluster_idx);
+                let worker_nodes = self.worker_nodes_for(cluster_idx);
+
+                // Control Plane section
+                if !cp_nodes.is_empty() {
+                    let is_selected = self.selected_item == NodeListItem::ControlPlaneHeader(cluster_idx);
+                    let expand_icon = if cluster.controlplane_expanded { "▼" } else { "▶" };
+                    let selector = if is_selected && nodes_focused { "▸" } else { " " };
+                    let header_style = if is_selected {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Blue)
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{} {} ", selector, expand_icon), header_style),
+                        Span::styled(format!("Control Plane ({})", cp_nodes.len()), header_style),
+                    ]));
+
+                    // Show control plane nodes if expanded
+                    if cluster.controlplane_expanded {
+                        for (idx, (_, v)) in cp_nodes.iter().enumerate() {
+                            let node_name = if v.node.is_empty() { "node".to_string() } else { v.node.clone() };
+                            let is_node_selected = self.selected_item == NodeListItem::ControlPlaneNode(cluster_idx, idx);
+
+                            // Health indicator
+                            let mem_pct = self.get_node_memory_for(cluster_idx, &v.node).map(|m| m.usage_percent()).unwrap_or(0.0);
+                            let svc_healthy = self.get_node_services_for(cluster_idx, &v.node)
+                                .map(|services| services.iter().all(|s| s.health.as_ref().map(|h| h.healthy).unwrap_or(true)))
+                                .unwrap_or(true);
+                            let health_symbol = if svc_healthy && mem_pct < 90.0 { "●" } else { "◐" };
+                            let health_color = if svc_healthy && mem_pct < 90.0 { Color::Green } else { Color::Yellow };
+
+                            let selector = if is_node_selected && nodes_focused { "▸" } else { " " };
+                            let name_style = if is_node_selected {
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(format!("{} {} ", selector, health_symbol), Style::default().fg(health_color)),
+                                Span::styled(node_name, name_style),
+                            ]));
+                        }
                     }
                 }
-            }
 
-            // Workers section
-            if !worker_nodes.is_empty() {
-                let is_selected = self.selected_item == NodeListItem::WorkersHeader;
-                let expand_icon = if self.workers_expanded { "▼" } else { "▶" };
-                let selector = if is_selected && nodes_focused { "▸" } else { " " };
-                let header_style = if is_selected {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Blue)
-                };
+                // Workers section
+                if !worker_nodes.is_empty() {
+                    let is_selected = self.selected_item == NodeListItem::WorkersHeader(cluster_idx);
+                    let expand_icon = if cluster.workers_expanded { "▼" } else { "▶" };
+                    let selector = if is_selected && nodes_focused { "▸" } else { " " };
+                    let header_style = if is_selected {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Blue)
+                    };
 
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {} {} ", selector, expand_icon), header_style),
-                    Span::styled(format!("Workers ({})", worker_nodes.len()), header_style),
-                ]));
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{} {} ", selector, expand_icon), header_style),
+                        Span::styled(format!("Workers ({})", worker_nodes.len()), header_style),
+                    ]));
 
-                // Show worker nodes if expanded
-                if self.workers_expanded {
-                    for (idx, (_, v)) in worker_nodes.iter().enumerate() {
-                        let node_name = if v.node.is_empty() { "node".to_string() } else { v.node.clone() };
-                        let is_node_selected = self.selected_item == NodeListItem::WorkerNode(idx);
+                    // Show worker nodes if expanded
+                    if cluster.workers_expanded {
+                        for (idx, (_, v)) in worker_nodes.iter().enumerate() {
+                            let node_name = if v.node.is_empty() { "node".to_string() } else { v.node.clone() };
+                            let is_node_selected = self.selected_item == NodeListItem::WorkerNode(cluster_idx, idx);
 
-                        // Health indicator
-                        let mem_pct = self.get_node_memory(&v.node).map(|m| m.usage_percent()).unwrap_or(0.0);
-                        let svc_healthy = self.get_node_services(&v.node)
-                            .map(|services| services.iter().all(|s| s.health.as_ref().map(|h| h.healthy).unwrap_or(true)))
-                            .unwrap_or(true);
-                        let health_symbol = if svc_healthy && mem_pct < 90.0 { "●" } else { "◐" };
-                        let health_color = if svc_healthy && mem_pct < 90.0 { Color::Green } else { Color::Yellow };
+                            // Health indicator
+                            let mem_pct = self.get_node_memory_for(cluster_idx, &v.node).map(|m| m.usage_percent()).unwrap_or(0.0);
+                            let svc_healthy = self.get_node_services_for(cluster_idx, &v.node)
+                                .map(|services| services.iter().all(|s| s.health.as_ref().map(|h| h.healthy).unwrap_or(true)))
+                                .unwrap_or(true);
+                            let health_symbol = if svc_healthy && mem_pct < 90.0 { "●" } else { "◐" };
+                            let health_color = if svc_healthy && mem_pct < 90.0 { Color::Green } else { Color::Yellow };
 
-                        let selector = if is_node_selected && nodes_focused { "▸" } else { " " };
-                        let name_style = if is_node_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::White)
-                        };
+                            let selector = if is_node_selected && nodes_focused { "▸" } else { " " };
+                            let name_style = if is_node_selected {
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
 
-                        lines.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(format!("{} {} ", selector, health_symbol), Style::default().fg(health_color)),
-                            Span::styled(node_name, name_style),
-                        ]));
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(format!("{} {} ", selector, health_symbol), Style::default().fg(health_color)),
+                                Span::styled(node_name, name_style),
+                            ]));
+                        }
                     }
                 }
             }
@@ -1355,8 +1378,16 @@ impl ClusterComponent {
             Color::DarkGray
         };
 
-        // Show bootstrap guidance if cluster is not bootstrapped
-        if self.etcd_fetch_attempted && self.etcd_members.is_empty() {
+        // Get active cluster data
+        let cluster_idx = self.active_cluster;
+        let cluster = self.clusters.get(cluster_idx);
+
+        // Check if cluster is connected but has no etcd members (not bootstrapped)
+        let needs_bootstrap = cluster
+            .map(|c| c.connected && c.etcd_members.is_empty() && c.versions.is_empty())
+            .unwrap_or(false);
+
+        if needs_bootstrap {
             let block = Block::default()
                 .title(" Bootstrap Required ")
                 .title_style(Style::default().fg(Color::Yellow))
@@ -1400,7 +1431,8 @@ impl ClusterComponent {
             return;
         }
 
-        if self.versions.is_empty() {
+        let versions_empty = cluster.map(|c| c.versions.is_empty()).unwrap_or(true);
+        if versions_empty {
             let block = Block::default()
                 .title(" Details ")
                 .borders(Borders::ALL)
@@ -1417,9 +1449,18 @@ impl ClusterComponent {
         let Some(node_name_str) = self.current_node_name() else {
             // Header selected - show group summary
             let (title, count) = match &self.selected_item {
-                NodeListItem::ControlPlaneHeader => ("Control Plane", self.controlplane_nodes().len()),
-                NodeListItem::WorkersHeader => ("Workers", self.worker_nodes().len()),
-                _ => ("Details", 0),
+                NodeListItem::ClusterHeader(idx) => {
+                    let name = self.clusters.get(*idx).map(|c| c.name.as_str()).unwrap_or("Cluster");
+                    let node_count = self.clusters.get(*idx).map(|c| c.versions.len()).unwrap_or(0);
+                    (name.to_string(), node_count)
+                }
+                NodeListItem::ControlPlaneHeader(idx) => {
+                    ("Control Plane".to_string(), self.controlplane_nodes_for(*idx).len())
+                }
+                NodeListItem::WorkersHeader(idx) => {
+                    ("Workers".to_string(), self.worker_nodes_for(*idx).len())
+                }
+                _ => ("Details".to_string(), 0),
             };
             let block = Block::default()
                 .title(format!(" {} ", title))
@@ -1446,7 +1487,7 @@ impl ClusterComponent {
         };
 
         let node_name = if node_name_str.is_empty() { "node-0".to_string() } else { node_name_str.clone() };
-        let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or_default();
+        let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or_default();
         let role = if self.get_node_services(&node_name)
             .map(|s| s.iter().any(|svc| svc.id == "etcd"))
             .unwrap_or(false)
