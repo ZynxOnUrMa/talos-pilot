@@ -46,3 +46,6 @@ x509-parser.workspace = true
 
 # Date/time handling
 chrono.workspace = true
+
+# Home directory
+dirs-next.workspace = true

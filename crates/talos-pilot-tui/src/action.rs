@@ -45,6 +45,8 @@ pub enum Action {
     ShowWorkloads,
     /// Show node operations overlay: (hostname, address, is_controlplane)
     ShowNodeOperations(String, String, bool),
+    /// Show rolling operations overlay with node list: Vec<(hostname, address, is_controlplane)>
+    ShowRollingOperations(Vec<(String, String, bool)>),
 
     // UI state
     Tick,

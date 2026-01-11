@@ -2808,6 +2808,7 @@ dependencies = [
  "chrono",
  "color-eyre",
  "crossterm",
+ "dirs-next",
  "futures",
  "k8s-openapi",
  "kube",

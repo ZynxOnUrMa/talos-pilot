@@ -4,7 +4,7 @@
 
 use crate::action::Action;
 use crate::components::Component;
-use crate::components::diagnostics::k8s::{check_pdb_health, create_k8s_client, PdbHealthInfo};
+use crate::components::diagnostics::k8s::{check_pdb_health, create_k8s_client, DrainOptions, PdbHealthInfo};
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use kube::Client;
@@ -127,10 +127,15 @@ async fn run_drain_operation(
     progress: Arc<Mutex<OperationProgress>>,
     hostname: String,
     k8s_client: Option<Client>,
+    options: DrainOptions,
 ) -> OperationResult {
+    use crate::audit::{audit_start, audit_success, audit_failure};
     use crate::components::diagnostics::k8s::{cordon_node, uncordon_node, drain_node_with_progress, DrainProgressCallback};
 
+    audit_start("DRAIN", &hostname, "Starting drain operation");
+
     let Some(k8s) = k8s_client else {
+        audit_failure("DRAIN", &hostname, "No K8s client available");
         return OperationResult {
             success: false,
             message: "No K8s client available".to_string(),
@@ -176,13 +181,18 @@ async fn run_drain_operation(
         }
     });
 
-    let drain_result = drain_node_with_progress(&k8s, &hostname, true, true, Some(callback)).await;
+    let drain_result = drain_node_with_progress(&k8s, &hostname, &options, Some(callback)).await;
     match drain_result {
         Ok(result) => {
             if result.success {
+                let mut msg = format!("Drained {} pods", result.pods_evicted);
+                if !result.force_deleted_pods.is_empty() {
+                    msg.push_str(&format!(" ({} force-deleted)", result.force_deleted_pods.len()));
+                }
+                audit_success("DRAIN", &hostname, &msg);
                 OperationResult {
                     success: true,
-                    message: format!("Drained {} pods", result.pods_evicted),
+                    message: msg,
                 }
             } else {
                 // Drain failed - uncordon the node to restore scheduling
@@ -192,14 +202,16 @@ async fn run_drain_operation(
                 }
                 let _ = uncordon_node(&k8s, &hostname).await;
 
+                let msg = format!(
+                    "Evicted {} pods, {} failed (node uncordoned): {}",
+                    result.pods_evicted,
+                    result.failed_pods.len(),
+                    result.failed_pods.join(", ")
+                );
+                audit_failure("DRAIN", &hostname, &msg);
                 OperationResult {
                     success: false,
-                    message: format!(
-                        "Evicted {} pods, {} failed (node uncordoned): {}",
-                        result.pods_evicted,
-                        result.failed_pods.len(),
-                        result.failed_pods.join(", ")
-                    ),
+                    message: msg,
                 }
             }
         }
@@ -211,9 +223,11 @@ async fn run_drain_operation(
             }
             let _ = uncordon_node(&k8s, &hostname).await;
 
+            let msg = format!("Failed to drain (node uncordoned): {}", e);
+            audit_failure("DRAIN", &hostname, &msg);
             OperationResult {
                 success: false,
-                message: format!("Failed to drain (node uncordoned): {}", e),
+                message: msg,
             }
         }
     }
@@ -226,11 +240,16 @@ async fn run_reboot_operation(
     address: String,
     k8s_client: Option<Client>,
     talos_client: Option<TalosClient>,
+    options: DrainOptions,
 ) -> OperationResult {
+    use crate::audit::{audit_start, audit_success, audit_failure};
     use crate::components::diagnostics::k8s::{cordon_node, uncordon_node, drain_node_with_progress, DrainProgressCallback};
     use talos_rs::RebootMode;
 
+    audit_start("REBOOT", &hostname, "Starting reboot operation");
+
     let Some(k8s) = k8s_client else {
+        audit_failure("REBOOT", &hostname, "No K8s client available");
         return OperationResult {
             success: false,
             message: "No K8s client available".to_string(),
@@ -238,6 +257,7 @@ async fn run_reboot_operation(
     };
 
     let Some(client) = talos_client else {
+        audit_failure("REBOOT", &hostname, "No Talos client available");
         return OperationResult {
             success: false,
             message: "No Talos client available".to_string(),
@@ -283,7 +303,7 @@ async fn run_reboot_operation(
         }
     });
 
-    let drain_result = drain_node_with_progress(&k8s, &hostname, true, true, Some(callback)).await;
+    let drain_result = drain_node_with_progress(&k8s, &hostname, &options, Some(callback)).await;
     match drain_result {
         Ok(result) if !result.success => {
             // Drain had failures - uncordon and abort reboot
@@ -293,12 +313,14 @@ async fn run_reboot_operation(
             }
             let _ = uncordon_node(&k8s, &hostname).await;
 
+            let msg = format!(
+                "Reboot aborted - drain failed (node uncordoned): {}",
+                result.failed_pods.join(", ")
+            );
+            audit_failure("REBOOT", &hostname, &msg);
             return OperationResult {
                 success: false,
-                message: format!(
-                    "Reboot aborted - drain failed (node uncordoned): {}",
-                    result.failed_pods.join(", ")
-                ),
+                message: msg,
             };
         }
         Err(e) => {
@@ -309,9 +331,11 @@ async fn run_reboot_operation(
             }
             let _ = uncordon_node(&k8s, &hostname).await;
 
+            let msg = format!("Reboot aborted - drain failed (node uncordoned): {}", e);
+            audit_failure("REBOOT", &hostname, &msg);
             return OperationResult {
                 success: false,
-                message: format!("Reboot aborted - drain failed (node uncordoned): {}", e),
+                message: msg,
             };
         }
         _ => {}
@@ -325,14 +349,21 @@ async fn run_reboot_operation(
 
     let node_client = client.with_node(&address);
     match node_client.reboot(RebootMode::Default).await {
-        Ok(result) => OperationResult {
-            success: result.success,
-            message: if result.success {
-                "Reboot initiated (node will uncordon on boot)".to_string()
-            } else {
-                "Reboot request sent but status unclear".to_string()
-            },
-        },
+        Ok(result) if !result.success => {
+            // Reboot request failed - uncordon
+            {
+                let mut p = progress.lock().unwrap();
+                p.message = "Reboot failed, uncordoning node...".to_string();
+            }
+            let _ = uncordon_node(&k8s, &hostname).await;
+
+            let msg = "Reboot request failed (node uncordoned)".to_string();
+            audit_failure("REBOOT", &hostname, &msg);
+            return OperationResult {
+                success: false,
+                message: msg,
+            };
+        }
         Err(e) => {
             // Reboot failed - uncordon the node
             {
@@ -341,11 +372,106 @@ async fn run_reboot_operation(
             }
             let _ = uncordon_node(&k8s, &hostname).await;
 
-            OperationResult {
+            let msg = format!("Failed to reboot (node uncordoned): {}", e);
+            audit_failure("REBOOT", &hostname, &msg);
+            return OperationResult {
                 success: false,
-                message: format!("Failed to reboot (node uncordoned): {}", e),
+                message: msg,
+            };
+        }
+        _ => {}
+    }
+
+    // Step 4: Wait for node to come back (if configured)
+    if options.wait_for_node_ready {
+        use crate::components::diagnostics::k8s::{wait_for_node_ready, NodeReadyProgressCallback};
+
+        let progress_clone = progress.clone();
+        let ready_callback: NodeReadyProgressCallback = Box::new(move |msg: &str| {
+            if let Ok(mut p) = progress_clone.lock() {
+                p.message = msg.to_string();
+            }
+        });
+
+        let ready_result = wait_for_node_ready(
+            &k8s,
+            &hostname,
+            options.post_reboot_timeout_secs,
+            true, // wait for disconnect first
+            Some(ready_callback),
+        ).await;
+
+        match ready_result {
+            Ok(result) if result.success => {
+                // Node is back and Ready
+                if options.uncordon_after_reboot {
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.message = "Uncordoning node...".to_string();
+                    }
+
+                    if let Err(e) = uncordon_node(&k8s, &hostname).await {
+                        let msg = format!(
+                            "Reboot completed ({}s), but failed to uncordon: {}",
+                            result.time_taken_secs, e
+                        );
+                        audit_success("REBOOT", &hostname, &msg);
+                        return OperationResult {
+                            success: true, // Reboot succeeded, just uncordon failed
+                            message: msg,
+                        };
+                    }
+
+                    let msg = format!(
+                        "Reboot completed successfully ({}s), node uncordoned",
+                        result.time_taken_secs
+                    );
+                    audit_success("REBOOT", &hostname, &msg);
+                    return OperationResult {
+                        success: true,
+                        message: msg,
+                    };
+                } else {
+                    let msg = format!(
+                        "Reboot completed successfully ({}s), node still cordoned",
+                        result.time_taken_secs
+                    );
+                    audit_success("REBOOT", &hostname, &msg);
+                    return OperationResult {
+                        success: true,
+                        message: msg,
+                    };
+                }
+            }
+            Ok(result) => {
+                // Timeout waiting for node
+                let msg = format!(
+                    "Reboot initiated but node didn't become Ready: {}",
+                    result.error.unwrap_or_default()
+                );
+                audit_failure("REBOOT", &hostname, &msg);
+                return OperationResult {
+                    success: false,
+                    message: msg,
+                };
+            }
+            Err(e) => {
+                let msg = format!("Reboot initiated but error checking node status: {}", e);
+                audit_failure("REBOOT", &hostname, &msg);
+                return OperationResult {
+                    success: false,
+                    message: msg,
+                };
             }
         }
+    }
+
+    // No post-reboot verification - just report success
+    let msg = "Reboot initiated (verification disabled)".to_string();
+    audit_success("REBOOT", &hostname, &msg);
+    OperationResult {
+        success: true,
+        message: msg,
     }
 }
 
@@ -390,6 +516,9 @@ pub struct NodeOperationsComponent {
     operation_task: Option<JoinHandle<OperationResult>>,
     /// Shared progress state for background operations
     operation_progress: Arc<Mutex<OperationProgress>>,
+
+    /// Drain options (configurable timeouts, force delete, etc.)
+    drain_options: DrainOptions,
 }
 
 impl Default for NodeOperationsComponent {
@@ -417,7 +546,13 @@ impl NodeOperationsComponent {
             operation_state: OperationState::Ready,
             operation_task: None,
             operation_progress: Arc::new(Mutex::new(OperationProgress::default())),
+            drain_options: DrainOptions::default(),
         }
+    }
+
+    /// Get a mutable reference to drain options for configuration
+    pub fn drain_options_mut(&mut self) -> &mut DrainOptions {
+        &mut self.drain_options
     }
 
     /// Set the Talos client
@@ -484,14 +619,15 @@ impl NodeOperationsComponent {
         let address = self.address.clone();
         let k8s_client = self.k8s_client.clone();
         let talos_client = self.client.clone();
+        let drain_options = self.drain_options.clone();
 
         let task = tokio::spawn(async move {
             match op_type {
                 OperationType::Drain => {
-                    run_drain_operation(progress, hostname, k8s_client).await
+                    run_drain_operation(progress, hostname, k8s_client, drain_options).await
                 }
                 OperationType::Reboot => {
-                    run_reboot_operation(progress, hostname, address, k8s_client, talos_client).await
+                    run_reboot_operation(progress, hostname, address, k8s_client, talos_client, drain_options).await
                 }
             }
         });

@@ -110,6 +110,36 @@ kubectl port-forward -n kube-system svc/hubble-ui 12000:80
 hubble observe --follow
 ```
 
+### Testing Rolling Operations (Multi-Node)
+
+For testing rolling drain/reboot across multiple nodes, use the dedicated script:
+
+```bash
+# Create 4-node cluster (1 control plane + 3 workers)
+./scripts/rolling-ops-test.sh create
+
+# Check node layout and workload distribution
+./scripts/rolling-ops-test.sh status
+
+# Run talos-pilot
+export KUBECONFIG=$(pwd)/output/kubeconfig
+cargo run --bin talos-pilot
+
+# In talos-pilot:
+# 1. Press 'O' (capital O) in cluster view
+# 2. Select nodes with Space/Enter - shows [1], [2], [3] order
+# 3. Press 'd' for rolling drain or 'r' for rolling reboot
+# 4. Confirm with 'y'
+
+# Clean up
+./scripts/rolling-ops-test.sh destroy
+```
+
+The rolling ops test cluster includes:
+- 4 nodes for realistic multi-node testing
+- Pre-configured `test-drainable` workloads with PDB
+- Audit logging to `~/.talos-pilot/audit.log`
+
 ### Testing Pre-Operation Health Checks
 
 ```bash
@@ -136,7 +166,9 @@ test-clusters/
 │   ├── cilium-ebpf.yaml    # Cilium eBPF mode (no kube-proxy)
 │   └── hubble.yaml         # Hubble config reference
 ├── scripts/
-│   └── cluster.sh      # Main cluster management script
+│   ├── cluster.sh          # Main cluster management script
+│   ├── rolling-ops-test.sh # 4-node cluster for rolling operations
+│   └── nuke.sh             # Complete cluster cleanup
 └── output/             # Generated files (gitignored)
     └── kubeconfig      # Cluster kubeconfig
 ```

@@ -12,6 +12,7 @@ pub mod multi_logs;
 pub mod network;
 pub mod node_operations;
 pub mod processes;
+pub mod rolling_operations;
 pub mod security;
 pub mod workloads;
 
@@ -25,6 +26,7 @@ pub use multi_logs::MultiLogsComponent;
 pub use network::NetworkStatsComponent;
 pub use node_operations::NodeOperationsComponent;
 pub use processes::ProcessesComponent;
+pub use rolling_operations::RollingOperationsComponent;
 pub use security::SecurityComponent;
 pub use workloads::WorkloadHealthComponent;
 

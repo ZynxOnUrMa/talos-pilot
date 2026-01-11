@@ -423,8 +423,46 @@ pub struct DrainResult {
     pub pods_evicted: usize,
     /// Pods that failed to evict
     pub failed_pods: Vec<String>,
+    /// Pods that were force-deleted
+    pub force_deleted_pods: Vec<String>,
     /// Error message if failed
     pub error: Option<String>,
+}
+
+/// Options for drain and reboot operations
+#[derive(Debug, Clone)]
+pub struct DrainOptions {
+    /// Timeout per pod for PDB retry (seconds)
+    pub per_pod_timeout_secs: u64,
+    /// Grace period for pod termination (None = use pod's default)
+    pub grace_period_secs: Option<i64>,
+    /// Force delete pods that can't be evicted (unmanaged pods)
+    pub force_delete_unmanaged: bool,
+    /// Ignore DaemonSet pods
+    pub ignore_daemonsets: bool,
+    /// Delete pods with emptyDir volumes
+    pub delete_emptydir_data: bool,
+    /// Wait for node to become Ready after reboot
+    pub wait_for_node_ready: bool,
+    /// Timeout for waiting for node to become Ready (seconds)
+    pub post_reboot_timeout_secs: u64,
+    /// Uncordon node after it becomes Ready
+    pub uncordon_after_reboot: bool,
+}
+
+impl Default for DrainOptions {
+    fn default() -> Self {
+        Self {
+            per_pod_timeout_secs: 30,
+            grace_period_secs: None, // Use pod's default
+            force_delete_unmanaged: false,
+            ignore_daemonsets: true,
+            delete_emptydir_data: true,
+            wait_for_node_ready: true,  // Safe default for production
+            post_reboot_timeout_secs: 300, // 5 minutes
+            uncordon_after_reboot: true,  // Auto-uncordon when healthy
+        }
+    }
 }
 
 /// Cordon a node (mark as unschedulable)
@@ -494,6 +532,15 @@ pub async fn uncordon_node(client: &Client, node_name: &str) -> Result<CordonRes
 /// Progress callback type for drain operations
 pub type DrainProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Information about a pod to evict
+#[derive(Debug, Clone)]
+struct PodToEvict {
+    namespace: String,
+    name: String,
+    /// Whether this pod is managed by a controller (ReplicaSet, Deployment, etc.)
+    is_managed: bool,
+}
+
 /// Drain a node (evict all pods)
 ///
 /// This will:
@@ -503,21 +550,20 @@ pub type DrainProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
 pub async fn drain_node(
     client: &Client,
     node_name: &str,
-    ignore_daemonsets: bool,
-    delete_emptydir_data: bool,
-    _timeout_seconds: u64,
+    options: &DrainOptions,
 ) -> Result<DrainResult, K8sError> {
-    drain_node_with_progress(client, node_name, ignore_daemonsets, delete_emptydir_data, None).await
+    drain_node_with_progress(client, node_name, options, None).await
 }
 
 /// Drain a node with progress callback
 pub async fn drain_node_with_progress(
     client: &Client,
     node_name: &str,
-    ignore_daemonsets: bool,
-    delete_emptydir_data: bool,
+    options: &DrainOptions,
     progress_callback: Option<DrainProgressCallback>,
 ) -> Result<DrainResult, K8sError> {
+    use kube::api::DeleteParams;
+
     let pods: Api<Pod> = Api::all(client.clone());
 
     // List pods on this node
@@ -530,7 +576,7 @@ pub async fn drain_node_with_progress(
         .map_err(|e| K8sError::ApiError(format!("Failed to list pods: {}", e)))?;
 
     let mut pods_to_evict = Vec::new();
-    let mut skipped_daemonset = 0;
+    let mut _skipped_daemonset = 0;
 
     for pod in pod_list.items {
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
@@ -543,14 +589,20 @@ pub async fn drain_node_with_progress(
             }
         }
 
-        // Check if pod is owned by a DaemonSet
-        let is_daemonset_pod = pod.metadata.owner_references.as_ref().map_or(false, |refs| {
+        // Check if pod is owned by a controller (managed)
+        let owner_refs = pod.metadata.owner_references.as_ref();
+        let is_daemonset_pod = owner_refs.map_or(false, |refs| {
             refs.iter().any(|r| r.kind == "DaemonSet")
+        });
+        let is_managed = owner_refs.map_or(false, |refs| {
+            refs.iter().any(|r| {
+                matches!(r.kind.as_str(), "ReplicaSet" | "Deployment" | "StatefulSet" | "Job" | "DaemonSet")
+            })
         });
 
         if is_daemonset_pod {
-            if ignore_daemonsets {
-                skipped_daemonset += 1;
+            if options.ignore_daemonsets {
+                _skipped_daemonset += 1;
                 continue;
             }
             // DaemonSet pods can't be evicted without ignoring them
@@ -563,28 +615,42 @@ pub async fn drain_node_with_progress(
             })
         });
 
-        if has_emptydir && !delete_emptydir_data {
+        if has_emptydir && !options.delete_emptydir_data {
             // Skip pods with emptyDir unless explicitly allowed
             continue;
         }
 
-        pods_to_evict.push((namespace, pod_name));
+        pods_to_evict.push(PodToEvict {
+            namespace,
+            name: pod_name,
+            is_managed,
+        });
     }
 
     let total_pods = pods_to_evict.len();
     let mut evicted = 0;
     let mut failed_pods = Vec::new();
+    let mut force_deleted_pods = Vec::new();
 
     // Report initial count
     if let Some(ref cb) = progress_callback {
         cb(&format!("Found {} pods to evict", total_pods));
     }
 
+    // Calculate max attempts based on configurable timeout
+    // Each attempt waits 2 seconds, so max_attempts = timeout / 2
+    let max_attempts = (options.per_pod_timeout_secs / 2).max(1) as usize;
+
+    // Eviction uses the pod's configured grace period by default.
+    // Custom grace_period_secs is only applied to force-delete operations.
+    let evict_params = EvictParams::default();
+
     // Evict pods one at a time, respecting PDBs
     // PDBs may temporarily block eviction, so we retry with backoff
-    for (idx, (namespace, pod_name)) in pods_to_evict.into_iter().enumerate() {
-        let ns_pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-        let evict_params = EvictParams::default();
+    for (idx, pod_info) in pods_to_evict.into_iter().enumerate() {
+        let namespace = &pod_info.namespace;
+        let pod_name = &pod_info.name;
+        let ns_pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
 
         // Report which pod we're evicting
         if let Some(ref cb) = progress_callback {
@@ -592,11 +658,10 @@ pub async fn drain_node_with_progress(
         }
 
         let mut attempts = 0;
-        let max_attempts = 15; // 15 attempts * 2 seconds = 30 seconds max per pod
         let mut success = false;
 
         while attempts < max_attempts && !success {
-            match ns_pods.evict(&pod_name, &evict_params).await {
+            match ns_pods.evict(pod_name, &evict_params).await {
                 Ok(_) => {
                     evicted += 1;
                     tracing::info!("Evicted pod {}/{}", namespace, pod_name);
@@ -646,11 +711,44 @@ pub async fn drain_node_with_progress(
                         continue;
                     }
 
-                    // Other error - fail immediately
+                    // Other error - check if we can force delete
                     tracing::warn!("Failed to evict {}/{}: {}", namespace, pod_name, e);
-                    failed_pods.push(format!("{}/{}", namespace, pod_name));
-                    if let Some(ref cb) = progress_callback {
-                        cb(&format!("Failed: {}/{}", namespace, pod_name));
+
+                    // Try force delete if enabled and pod is unmanaged
+                    if options.force_delete_unmanaged && !pod_info.is_managed {
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Force deleting unmanaged pod {}/{}", namespace, pod_name));
+                        }
+
+                        let delete_params = if let Some(grace) = options.grace_period_secs {
+                            DeleteParams::default().grace_period(grace as u32)
+                        } else {
+                            DeleteParams::default().grace_period(0)
+                        };
+
+                        match ns_pods.delete(pod_name, &delete_params).await {
+                            Ok(_) => {
+                                evicted += 1;
+                                force_deleted_pods.push(format!("{}/{}", namespace, pod_name));
+                                tracing::info!("Force deleted unmanaged pod {}/{}", namespace, pod_name);
+                                success = true;
+                                if let Some(ref cb) = progress_callback {
+                                    cb(&format!("Force deleted {}/{} ({}/{})", namespace, pod_name, evicted, total_pods));
+                                }
+                            }
+                            Err(del_err) => {
+                                tracing::warn!("Force delete failed for {}/{}: {}", namespace, pod_name, del_err);
+                                failed_pods.push(format!("{}/{}", namespace, pod_name));
+                                if let Some(ref cb) = progress_callback {
+                                    cb(&format!("Failed: {}/{}", namespace, pod_name));
+                                }
+                            }
+                        }
+                    } else {
+                        failed_pods.push(format!("{}/{}", namespace, pod_name));
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Failed: {}/{}", namespace, pod_name));
+                        }
                     }
                     break;
                 }
@@ -663,9 +761,41 @@ pub async fn drain_node_with_progress(
                 namespace,
                 pod_name
             );
-            failed_pods.push(format!("{}/{}", namespace, pod_name));
-            if let Some(ref cb) = progress_callback {
-                cb(&format!("Timeout: {}/{}", namespace, pod_name));
+
+            // Try force delete on timeout if enabled and pod is unmanaged
+            if options.force_delete_unmanaged && !pod_info.is_managed {
+                if let Some(ref cb) = progress_callback {
+                    cb(&format!("Force deleting unmanaged pod {}/{} after timeout", namespace, pod_name));
+                }
+
+                let delete_params = if let Some(grace) = options.grace_period_secs {
+                    DeleteParams::default().grace_period(grace as u32)
+                } else {
+                    DeleteParams::default().grace_period(0)
+                };
+
+                match ns_pods.delete(pod_name, &delete_params).await {
+                    Ok(_) => {
+                        evicted += 1;
+                        force_deleted_pods.push(format!("{}/{}", namespace, pod_name));
+                        tracing::info!("Force deleted unmanaged pod {}/{} after timeout", namespace, pod_name);
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Force deleted {}/{} ({}/{})", namespace, pod_name, evicted, total_pods));
+                        }
+                    }
+                    Err(del_err) => {
+                        tracing::warn!("Force delete failed for {}/{}: {}", namespace, pod_name, del_err);
+                        failed_pods.push(format!("{}/{}", namespace, pod_name));
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Timeout: {}/{}", namespace, pod_name));
+                        }
+                    }
+                }
+            } else {
+                failed_pods.push(format!("{}/{}", namespace, pod_name));
+                if let Some(ref cb) = progress_callback {
+                    cb(&format!("Timeout: {}/{}", namespace, pod_name));
+                }
             }
         }
     }
@@ -675,6 +805,174 @@ pub async fn drain_node_with_progress(
         success: failed_pods.is_empty(),
         pods_evicted: evicted,
         failed_pods,
+        force_deleted_pods,
         error: None,
     })
+}
+
+// ==================== Post-Operation Verification ====================
+
+/// Result of waiting for a node to become ready
+#[derive(Debug, Clone)]
+pub struct NodeReadyResult {
+    /// Whether the node became ready
+    pub success: bool,
+    /// Time taken to become ready (seconds)
+    pub time_taken_secs: u64,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Node condition status from Kubernetes
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeConditionStatus {
+    Ready,
+    NotReady,
+    Unknown,
+}
+
+/// Get the current ready status of a node
+pub async fn get_node_ready_status(client: &Client, node_name: &str) -> Result<NodeConditionStatus, K8sError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+
+    let node = nodes
+        .get(node_name)
+        .await
+        .map_err(|e| K8sError::ApiError(format!("Failed to get node: {}", e)))?;
+
+    let conditions = node.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref());
+
+    if let Some(conditions) = conditions {
+        for condition in conditions {
+            if condition.type_ == "Ready" {
+                return match condition.status.as_str() {
+                    "True" => Ok(NodeConditionStatus::Ready),
+                    "False" => Ok(NodeConditionStatus::NotReady),
+                    _ => Ok(NodeConditionStatus::Unknown),
+                };
+            }
+        }
+    }
+
+    Ok(NodeConditionStatus::Unknown)
+}
+
+/// Check if a node exists and is reachable in the cluster
+pub async fn node_exists(client: &Client, node_name: &str) -> bool {
+    let nodes: Api<Node> = Api::all(client.clone());
+    nodes.get(node_name).await.is_ok()
+}
+
+/// Progress callback for node readiness waiting
+pub type NodeReadyProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Wait for a node to become Ready after reboot
+///
+/// This function:
+/// 1. Optionally waits for the node to disappear (confirm reboot started)
+/// 2. Waits for the node to reappear
+/// 3. Waits for the node condition to become Ready
+pub async fn wait_for_node_ready(
+    client: &Client,
+    node_name: &str,
+    timeout_secs: u64,
+    wait_for_disconnect: bool,
+    progress_callback: Option<NodeReadyProgressCallback>,
+) -> Result<NodeReadyResult, K8sError> {
+    let start = std::time::Instant::now();
+    let poll_interval = tokio::time::Duration::from_secs(5);
+
+    // Phase 1: Wait for node to disconnect (if requested)
+    if wait_for_disconnect {
+        if let Some(ref cb) = progress_callback {
+            cb("Waiting for node to begin rebooting...");
+        }
+
+        // Wait up to 60 seconds for the node to disconnect
+        let disconnect_timeout = 60;
+        let disconnect_start = std::time::Instant::now();
+        let mut disconnected = false;
+
+        while disconnect_start.elapsed().as_secs() < disconnect_timeout {
+            match get_node_ready_status(client, node_name).await {
+                Ok(NodeConditionStatus::NotReady) | Ok(NodeConditionStatus::Unknown) => {
+                    disconnected = true;
+                    if let Some(ref cb) = progress_callback {
+                        cb("Node is rebooting...");
+                    }
+                    break;
+                }
+                Err(_) => {
+                    // API error might mean node is disconnecting
+                    disconnected = true;
+                    if let Some(ref cb) = progress_callback {
+                        cb("Node is rebooting...");
+                    }
+                    break;
+                }
+                Ok(NodeConditionStatus::Ready) => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+
+        if !disconnected {
+            // Node never went down - might be a problem, but continue waiting
+            if let Some(ref cb) = progress_callback {
+                cb("Warning: Node didn't appear to disconnect, continuing to wait...");
+            }
+        }
+    }
+
+    // Phase 2: Wait for node to become Ready
+    if let Some(ref cb) = progress_callback {
+        cb("Waiting for node to come back online...");
+    }
+
+    loop {
+        let elapsed = start.elapsed().as_secs();
+
+        if elapsed >= timeout_secs {
+            return Ok(NodeReadyResult {
+                success: false,
+                time_taken_secs: elapsed,
+                error: Some(format!("Timed out waiting for node after {}s", timeout_secs)),
+            });
+        }
+
+        // Check node status
+        match get_node_ready_status(client, node_name).await {
+            Ok(NodeConditionStatus::Ready) => {
+                if let Some(ref cb) = progress_callback {
+                    cb(&format!("Node is Ready (took {}s)", elapsed));
+                }
+                return Ok(NodeReadyResult {
+                    success: true,
+                    time_taken_secs: elapsed,
+                    error: None,
+                });
+            }
+            Ok(status) => {
+                let remaining = timeout_secs - elapsed;
+                if let Some(ref cb) = progress_callback {
+                    let status_str = match status {
+                        NodeConditionStatus::NotReady => "NotReady",
+                        NodeConditionStatus::Unknown => "Unknown",
+                        _ => "Unknown",
+                    };
+                    cb(&format!("Node status: {} ({}s remaining)", status_str, remaining));
+                }
+            }
+            Err(_) => {
+                let remaining = timeout_secs - elapsed;
+                if let Some(ref cb) = progress_callback {
+                    cb(&format!("Waiting for node to rejoin cluster ({}s remaining)", remaining));
+                }
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
 }

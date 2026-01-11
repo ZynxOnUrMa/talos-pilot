@@ -1,7 +1,8 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent, SecurityComponent, WorkloadHealthComponent};
+use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent, RollingOperationsComponent, SecurityComponent, WorkloadHealthComponent};
+use crate::components::rolling_operations::RollingNodeInfo;
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -21,6 +22,7 @@ enum View {
     Lifecycle,
     Workloads,
     NodeOperations,
+    RollingOperations,
 }
 
 /// Main application state
@@ -49,6 +51,8 @@ pub struct App {
     workloads: Option<WorkloadHealthComponent>,
     /// Node operations component (overlay for node operations)
     node_operations: Option<NodeOperationsComponent>,
+    /// Rolling operations component (overlay for multi-node operations)
+    rolling_operations: Option<RollingOperationsComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -91,6 +95,7 @@ impl App {
             lifecycle: None,
             workloads: None,
             node_operations: None,
+            rolling_operations: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -175,6 +180,13 @@ impl App {
                             let _ = node_ops.draw(frame, area);
                         }
                     }
+                    View::RollingOperations => {
+                        // Draw cluster in background, then overlay
+                        let _ = self.cluster.draw(frame, area);
+                        if let Some(rolling_ops) = &mut self.rolling_operations {
+                            let _ = rolling_ops.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -243,6 +255,13 @@ impl App {
                             View::NodeOperations => {
                                 if let Some(node_ops) = &mut self.node_operations {
                                     node_ops.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::RollingOperations => {
+                                if let Some(rolling_ops) = &mut self.rolling_operations {
+                                    rolling_ops.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -331,6 +350,9 @@ impl App {
                     View::NodeOperations => {
                         self.node_operations = None;
                     }
+                    View::RollingOperations => {
+                        self.rolling_operations = None;
+                    }
                     View::Cluster => {}
                 }
                 // Return to cluster view
@@ -407,6 +429,13 @@ impl App {
                     View::NodeOperations => {
                         if let Some(node_ops) = &mut self.node_operations
                             && let Some(next_action) = node_ops.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::RollingOperations => {
+                        if let Some(rolling_ops) = &mut self.rolling_operations
+                            && let Some(next_action) = rolling_ops.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -492,6 +521,9 @@ impl App {
                                 node_ops.set_error(e.to_string());
                             }
                         }
+                    }
+                    View::RollingOperations => {
+                        // Rolling operations doesn't have a refresh method
                     }
                 }
             }
@@ -715,6 +747,38 @@ impl App {
                 self.node_operations = Some(node_ops);
                 self.view = View::NodeOperations;
             }
+            Action::ShowRollingOperations(nodes) => {
+                // Show rolling operations overlay
+                tracing::info!("Viewing rolling operations for {} nodes", nodes.len());
+
+                // Create rolling operations component
+                let mut rolling_ops = RollingOperationsComponent::new();
+
+                // Convert node tuples to RollingNodeInfo
+                let node_infos: Vec<RollingNodeInfo> = nodes.into_iter()
+                    .map(|(hostname, address, is_controlplane)| RollingNodeInfo {
+                        hostname,
+                        address,
+                        is_controlplane,
+                        selection_order: None,
+                    })
+                    .collect();
+
+                rolling_ops.set_nodes(node_infos);
+
+                // Set clients
+                if let Some(talos_client) = self.cluster.client() {
+                    rolling_ops.set_talos_client(talos_client.clone());
+
+                    // Try to get K8s client
+                    if let Ok(k8s) = crate::components::diagnostics::k8s::create_k8s_client(talos_client).await {
+                        rolling_ops.set_k8s_client(k8s);
+                    }
+                }
+
+                self.rolling_operations = Some(rolling_ops);
+                self.view = View::RollingOperations;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -782,6 +846,13 @@ impl App {
                     View::NodeOperations => {
                         if let Some(node_ops) = &mut self.node_operations
                             && let Some(next_action) = node_ops.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::RollingOperations => {
+                        if let Some(rolling_ops) = &mut self.rolling_operations
+                            && let Some(next_action) = rolling_ops.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
