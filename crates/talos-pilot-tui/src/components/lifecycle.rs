@@ -4,8 +4,12 @@
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::diagnostics::k8s::{
+    check_pdb_health, check_pod_health, create_k8s_client, PdbHealthInfo, PodHealthInfo,
+};
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
+use kube::Client;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -62,6 +66,51 @@ impl AlertSeverity {
     }
 }
 
+/// etcd quorum information for pre-operation checks
+#[derive(Debug, Clone, Default)]
+pub struct EtcdQuorumInfo {
+    /// Total etcd members
+    pub total_members: usize,
+    /// Healthy etcd members
+    pub healthy_members: usize,
+    /// How many nodes can be lost while maintaining quorum
+    pub can_lose: usize,
+    /// Whether the cluster is healthy
+    pub is_healthy: bool,
+}
+
+impl EtcdQuorumInfo {
+    /// Get summary message
+    pub fn summary(&self) -> String {
+        if self.total_members == 0 {
+            "No etcd members found".to_string()
+        } else if self.is_healthy {
+            format!(
+                "{}/{} members, can lose {}",
+                self.healthy_members, self.total_members, self.can_lose
+            )
+        } else {
+            format!(
+                "{}/{} members healthy (quorum at risk)",
+                self.healthy_members, self.total_members
+            )
+        }
+    }
+}
+
+/// Pre-operation health check results
+#[derive(Debug, Clone, Default)]
+pub struct PreOpChecks {
+    /// Pod health info
+    pub pod_health: Option<PodHealthInfo>,
+    /// PDB health info
+    pub pdb_health: Option<PdbHealthInfo>,
+    /// etcd quorum info
+    pub etcd_quorum: Option<EtcdQuorumInfo>,
+    /// Whether all checks passed
+    pub all_passed: bool,
+}
+
 /// Lifecycle component for viewing version and lifecycle status
 pub struct LifecycleComponent {
     /// Context name (cluster identifier)
@@ -102,6 +151,12 @@ pub struct LifecycleComponent {
 
     /// Discovery members (from talosctl get members)
     discovery_members: Vec<DiscoveryMember>,
+
+    /// K8s client for pod/PDB checks
+    k8s_client: Option<Client>,
+
+    /// Pre-operation health checks
+    pre_op_checks: PreOpChecks,
 }
 
 impl Default for LifecycleComponent {
@@ -129,6 +184,8 @@ impl LifecycleComponent {
             auto_refresh: true,
             client: None,
             discovery_members: Vec::new(),
+            k8s_client: None,
+            pre_op_checks: PreOpChecks::default(),
         }
     }
 
@@ -148,7 +205,7 @@ impl LifecycleComponent {
         self.loading = true;
         self.error = None;
 
-        let Some(client) = &self.client else {
+        let Some(client) = self.client.clone() else {
             self.error = Some("No client configured".to_string());
             self.loading = false;
             return Ok(());
@@ -231,10 +288,91 @@ impl LifecycleComponent {
             })
             .collect();
 
+        // Fetch pre-operation health checks
+        self.fetch_pre_op_checks(&client).await;
+
         self.generate_alerts();
         self.loading = false;
         self.last_refresh = Some(Instant::now());
         Ok(())
+    }
+
+    /// Fetch pre-operation health checks
+    async fn fetch_pre_op_checks(&mut self, client: &TalosClient) {
+        // Initialize K8s client if not already done
+        if self.k8s_client.is_none() {
+            match create_k8s_client(client).await {
+                Ok(k8s) => {
+                    self.k8s_client = Some(k8s);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create K8s client: {}", e);
+                }
+            }
+        }
+
+        // Fetch etcd quorum info
+        let etcd_quorum = match client.etcd_members().await {
+            Ok(members) => {
+                let total = members.len();
+                // Try to get status to determine healthy members
+                let healthy = match client.etcd_status().await {
+                    Ok(statuses) => {
+                        // Count members with status
+                        members.iter().filter(|m| {
+                            statuses.iter().any(|s| s.member_id == m.id)
+                        }).count()
+                    }
+                    Err(_) => total, // Assume all healthy if we can't get status
+                };
+
+                let quorum_needed = total / 2 + 1;
+                let can_lose = if healthy >= quorum_needed {
+                    healthy - quorum_needed
+                } else {
+                    0
+                };
+
+                Some(EtcdQuorumInfo {
+                    total_members: total,
+                    healthy_members: healthy,
+                    can_lose,
+                    is_healthy: healthy >= quorum_needed,
+                })
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch etcd members: {}", e);
+                None
+            }
+        };
+
+        // Fetch pod and PDB health from K8s
+        let (pod_health, pdb_health) = if let Some(k8s) = &self.k8s_client {
+            let pod_result = check_pod_health(k8s).await;
+            let pdb_result = check_pdb_health(k8s).await;
+
+            (
+                pod_result.ok(),
+                pdb_result.ok(),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Determine if all checks passed
+        let all_passed = {
+            let pod_ok = pod_health.as_ref().map(|p| !p.has_issues()).unwrap_or(true);
+            let pdb_ok = pdb_health.as_ref().map(|p| !p.has_blocking_pdbs()).unwrap_or(true);
+            let etcd_ok = etcd_quorum.as_ref().map(|e| e.is_healthy && e.can_lose > 0).unwrap_or(true);
+            pod_ok && pdb_ok && etcd_ok
+        };
+
+        self.pre_op_checks = PreOpChecks {
+            pod_health,
+            pdb_health,
+            etcd_quorum,
+            all_passed,
+        };
     }
 
     /// Generate alerts based on current state
@@ -504,6 +642,117 @@ impl LifecycleComponent {
         frame.render_widget(paragraph, area);
     }
 
+    /// Draw the pre-operation health checks section
+    fn draw_pre_op_checks(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = Vec::new();
+
+        // Overall status indicator
+        let (overall_indicator, overall_color) = if self.pre_op_checks.all_passed {
+            ("✓", Color::Green)
+        } else {
+            ("!", Color::Yellow)
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(overall_indicator, Style::default().fg(overall_color)),
+            Span::raw(" "),
+            Span::styled(
+                if self.pre_op_checks.all_passed { "All checks passed" } else { "Some checks have warnings" },
+                Style::default().fg(overall_color),
+            ),
+        ]));
+
+        // etcd quorum check
+        if let Some(ref etcd) = self.pre_op_checks.etcd_quorum {
+            let (indicator, color) = if etcd.is_healthy && etcd.can_lose > 0 {
+                ("✓", Color::Green)
+            } else if etcd.is_healthy {
+                ("!", Color::Yellow)
+            } else {
+                ("✗", Color::Red)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(indicator, Style::default().fg(color)),
+                Span::raw(" etcd: "),
+                Span::styled(etcd.summary(), Style::default().fg(color)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("?", Style::default().fg(Color::DarkGray)),
+                Span::raw(" etcd: "),
+                Span::styled("unavailable", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        // Pod health check
+        if let Some(ref pods) = self.pre_op_checks.pod_health {
+            let has_issues = pods.has_issues();
+            let (indicator, color) = if !has_issues && pods.pending.is_empty() {
+                ("✓", Color::Green)
+            } else if !has_issues {
+                ("◐", Color::Yellow)
+            } else {
+                ("✗", Color::Red)
+            };
+
+            let running = pods.total_pods - pods.crashing.len() - pods.image_pull_errors.len() - pods.pending.len();
+            let summary = if has_issues || !pods.pending.is_empty() {
+                format!("{} running, {}", running, pods.summary())
+            } else {
+                format!("{} pods healthy", pods.total_pods)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(indicator, Style::default().fg(color)),
+                Span::raw(" Pods: "),
+                Span::styled(summary, Style::default().fg(color)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("?", Style::default().fg(Color::DarkGray)),
+                Span::raw(" Pods: "),
+                Span::styled("unavailable", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        // PDB check
+        if let Some(ref pdbs) = self.pre_op_checks.pdb_health {
+            let (indicator, color) = if !pdbs.has_blocking_pdbs() {
+                ("✓", Color::Green)
+            } else {
+                ("◐", Color::Yellow)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(indicator, Style::default().fg(color)),
+                Span::raw(" PDBs: "),
+                Span::styled(pdbs.summary(), Style::default().fg(color)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("?", Style::default().fg(Color::DarkGray)),
+                Span::raw(" PDBs: "),
+                Span::styled("unavailable", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        let block = Block::default()
+            .title(" Pre-Operation Checks ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, area);
+    }
+
     /// Draw the footer
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let spans = vec![
@@ -572,7 +821,8 @@ impl Component for LifecycleComponent {
         let chunks = Layout::vertical([
             Constraint::Length(1),  // Header
             Constraint::Length(10), // Versions section
-            Constraint::Min(8),     // Node table
+            Constraint::Length(7),  // Pre-Operation Checks (4 lines + border + padding)
+            Constraint::Min(6),     // Node table
             Constraint::Length(6),  // Alerts (3 lines + border)
             Constraint::Length(1),  // Footer
         ])
@@ -586,14 +836,17 @@ impl Component for LifecycleComponent {
         // Versions section
         self.draw_versions_section(frame, chunks[1]);
 
+        // Pre-Operation Checks
+        self.draw_pre_op_checks(frame, chunks[2]);
+
         // Node table
-        self.draw_node_table(frame, chunks[2]);
+        self.draw_node_table(frame, chunks[3]);
 
         // Alerts
-        self.draw_alerts_section(frame, chunks[3]);
+        self.draw_alerts_section(frame, chunks[4]);
 
         // Footer
-        self.draw_footer(frame, chunks[4]);
+        self.draw_footer(frame, chunks[5]);
 
         Ok(())
     }

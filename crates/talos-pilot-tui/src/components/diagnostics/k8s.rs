@@ -3,6 +3,7 @@
 //! Creates a K8s client from Talos-provided kubeconfig.
 
 use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     api::{Api, ListParams},
     Client, Config,
@@ -297,6 +298,101 @@ pub async fn check_pod_health(client: &Client) -> Result<PodHealthInfo, K8sError
                 });
             }
         }
+    }
+
+    Ok(info)
+}
+
+/// Information about a PodDisruptionBudget
+#[derive(Debug, Clone)]
+pub struct PdbInfo {
+    /// PDB name
+    pub name: String,
+    /// Namespace
+    pub namespace: String,
+    /// Current number of healthy pods
+    pub current_healthy: i32,
+    /// Desired number of healthy pods (minAvailable)
+    pub desired_healthy: i32,
+    /// Number of disruptions allowed
+    pub disruptions_allowed: i32,
+    /// Expected pods (total matching selector)
+    pub expected_pods: i32,
+    /// Whether this PDB would block a drain
+    pub would_block_drain: bool,
+}
+
+/// PDB health summary
+#[derive(Debug, Clone, Default)]
+pub struct PdbHealthInfo {
+    /// All PDBs in the cluster
+    pub pdbs: Vec<PdbInfo>,
+    /// PDBs that would block drain (disruptions_allowed == 0)
+    pub blocking_pdbs: Vec<PdbInfo>,
+}
+
+impl PdbHealthInfo {
+    /// Check if any PDBs would block a drain
+    pub fn has_blocking_pdbs(&self) -> bool {
+        !self.blocking_pdbs.is_empty()
+    }
+
+    /// Get summary message
+    pub fn summary(&self) -> String {
+        if self.pdbs.is_empty() {
+            "No PDBs configured".to_string()
+        } else if self.blocking_pdbs.is_empty() {
+            format!("{} PDBs, all allow disruption", self.pdbs.len())
+        } else {
+            format!(
+                "{} PDBs, {} would block drain",
+                self.pdbs.len(),
+                self.blocking_pdbs.len()
+            )
+        }
+    }
+}
+
+/// Check PodDisruptionBudgets across all namespaces
+///
+/// Identifies PDBs that would block a node drain operation.
+pub async fn check_pdb_health(client: &Client) -> Result<PdbHealthInfo, K8sError> {
+    let pdbs: Api<PodDisruptionBudget> = Api::all(client.clone());
+
+    let pdb_list = pdbs
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| K8sError::ApiError(e.to_string()))?;
+
+    let mut info = PdbHealthInfo::default();
+
+    for pdb in pdb_list.items {
+        let name = pdb.metadata.name.clone().unwrap_or_default();
+        let namespace = pdb.metadata.namespace.clone().unwrap_or_default();
+        let status = pdb.status.as_ref();
+
+        let current_healthy = status.map(|s| s.current_healthy).unwrap_or(0);
+        let desired_healthy = status.map(|s| s.desired_healthy).unwrap_or(0);
+        let disruptions_allowed = status.map(|s| s.disruptions_allowed).unwrap_or(0);
+        let expected_pods = status.map(|s| s.expected_pods).unwrap_or(0);
+
+        // A PDB blocks drain if disruptions_allowed is 0 and there are expected pods
+        let would_block_drain = disruptions_allowed == 0 && expected_pods > 0;
+
+        let pdb_info = PdbInfo {
+            name,
+            namespace,
+            current_healthy,
+            desired_healthy,
+            disruptions_allowed,
+            expected_pods,
+            would_block_drain,
+        };
+
+        if would_block_drain {
+            info.blocking_pdbs.push(pdb_info.clone());
+        }
+        info.pdbs.push(pdb_info);
     }
 
     Ok(info)
