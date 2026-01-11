@@ -157,7 +157,7 @@ pub enum CaptureState {
 }
 
 /// Packet capture data holder
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CaptureData {
     /// State of the capture
     pub state: CaptureState,
@@ -165,6 +165,20 @@ pub struct CaptureData {
     pub data: Vec<u8>,
     /// Receiver for capture stream (Option to allow taking ownership)
     pub receiver: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Whether to use BPF filter to exclude API traffic (port 50000)
+    /// Recommended to avoid feedback loop on management interface
+    pub use_bpf_filter: bool,
+}
+
+impl Default for CaptureData {
+    fn default() -> Self {
+        Self {
+            state: CaptureState::default(),
+            data: Vec::new(),
+            receiver: None,
+            use_bpf_filter: true, // ON by default to prevent feedback loops
+        }
+    }
 }
 
 /// Network stats component for viewing node network interfaces
@@ -1280,15 +1294,24 @@ impl NetworkStatsComponent {
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let auto_label = if self.auto_refresh { "auto:ON" } else { "auto:OFF" };
 
+        // BPF filter indicator with color coding
+        let (bpf_label, bpf_color) = if self.capture.use_bpf_filter {
+            ("BPF:ON", Color::Green)
+        } else {
+            ("BPF:OFF", Color::Yellow)
+        };
+
         let spans = vec![
             Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
             Span::raw(" views  "),
             Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-            Span::raw(" connections  "),
-            Span::styled("[1]", Style::default().fg(Color::Cyan)),
-            Span::raw(" traffic  "),
-            Span::styled("[2]", Style::default().fg(Color::Cyan)),
-            Span::raw(" errors  "),
+            Span::raw(" conns  "),
+            Span::styled("[c]", Style::default().fg(Color::Cyan)),
+            Span::raw(" capture  "),
+            Span::styled("[f]", Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled(bpf_label, Style::default().fg(bpf_color)),
+            Span::raw("  "),
             Span::styled("[a]", Style::default().fg(Color::Cyan)),
             Span::raw(format!(" {}  ", auto_label)),
             Span::styled("[q]", Style::default().fg(Color::Cyan)),
@@ -1511,6 +1534,13 @@ impl NetworkStatsComponent {
         let listen_label = if self.listening_only { "all" } else { "listen" };
         let all_label = if self.show_all_connections { "iface" } else { "all" };
 
+        // BPF filter indicator with color coding
+        let (bpf_label, bpf_color) = if self.capture.use_bpf_filter {
+            ("BPF:ON", Color::Green)
+        } else {
+            ("BPF:OFF", Color::Yellow)
+        };
+
         let spans = if self.conn_in_visual_mode() {
             // Visual mode footer
             vec![
@@ -1528,18 +1558,16 @@ impl NetworkStatsComponent {
             vec![
                 Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
                 Span::raw(" views  "),
-                Span::styled("[1]", Style::default().fg(Color::Cyan)),
-                Span::raw(" state  "),
-                Span::styled("[2]", Style::default().fg(Color::Cyan)),
-                Span::raw(" port  "),
+                Span::styled("[c]", Style::default().fg(Color::Cyan)),
+                Span::raw(" capture  "),
+                Span::styled("[f]", Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(bpf_label, Style::default().fg(bpf_color)),
+                Span::raw("  "),
                 Span::styled("[l]", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(" {}  ", listen_label)),
                 Span::styled("[a]", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(" {}  ", all_label)),
-                Span::styled("[d]", Style::default().fg(Color::Cyan)),
-                Span::raw(" dns  "),
-                Span::styled("[t]", Style::default().fg(Color::Cyan)),
-                Span::raw(" routes  "),
                 Span::styled("[q]", Style::default().fg(Color::Cyan)),
                 Span::raw(" back"),
             ]
@@ -2067,6 +2095,11 @@ impl NetworkStatsComponent {
                 self.save_capture();
                 Ok(None)
             }
+            // Toggle BPF filter for packet capture
+            KeyCode::Char('f') => {
+                self.toggle_bpf_filter();
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -2273,6 +2306,11 @@ impl NetworkStatsComponent {
             }
             KeyCode::Char('s') => {
                 self.save_capture();
+                Ok(None)
+            }
+            // Toggle BPF filter for packet capture
+            KeyCode::Char('f') => {
+                self.toggle_bpf_filter();
                 Ok(None)
             }
 
@@ -3168,14 +3206,24 @@ impl NetworkStatsComponent {
             };
 
             // Use snap_len=65535 to capture full packets
-            // NOTE: BPF filter disabled for now - was causing issues with Docker-based clusters
-            // The filter assumed raw IP packets but Docker may use Ethernet framing
-            // TODO: Detect link type and adjust BPF offsets accordingly
-            match client.packet_capture(interface, false, 65535).await {
+            // Optionally use BPF filter to exclude port 50000 (Talos API)
+            // to prevent feedback loop when capturing on management interface
+            let capture_result = if self.capture.use_bpf_filter {
+                client.packet_capture_exclude_api(interface, false, 65535).await
+            } else {
+                client.packet_capture(interface, false, 65535).await
+            };
+
+            match capture_result {
                 Ok(receiver) => {
                     self.capture.receiver = Some(receiver);
+                    let filter_status = if self.capture.use_bpf_filter {
+                        " [BPF filter on]"
+                    } else {
+                        " [NO filter]"
+                    };
                     self.status_message = Some((
-                        format!("Capturing on {} (save with 's')", interface),
+                        format!("Capturing on {}{} (save with 's')", interface, filter_status),
                         Instant::now(),
                     ));
                 }
@@ -3276,6 +3324,26 @@ impl NetworkStatsComponent {
                 ));
             }
         }
+    }
+
+    /// Toggle BPF filter on/off for packet capture
+    fn toggle_bpf_filter(&mut self) {
+        // Only allow toggle when not capturing
+        if self.is_capturing() {
+            self.status_message = Some((
+                "Stop capture first before changing filter setting".to_string(),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        self.capture.use_bpf_filter = !self.capture.use_bpf_filter;
+        let status = if self.capture.use_bpf_filter {
+            "BPF filter ON - excludes API port 50000"
+        } else {
+            "BPF filter OFF - WARNING: may cause feedback loop on mgmt interface"
+        };
+        self.status_message = Some((status.to_string(), Instant::now()));
     }
 
     /// Draw capture status bar at the top of connections view
