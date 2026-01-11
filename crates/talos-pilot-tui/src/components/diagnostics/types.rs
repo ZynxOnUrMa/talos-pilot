@@ -1,6 +1,7 @@
 //! Shared types for the diagnostics system
 
 use ratatui::style::Color;
+use talos_pilot_core::{HasHealth, HealthIndicator};
 
 /// Status of a diagnostic check
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,12 +21,32 @@ pub enum CheckStatus {
 impl CheckStatus {
     /// Get indicator character and color
     pub fn indicator(&self) -> (&'static str, Color) {
+        let health = self.health();
+        (
+            if matches!(self, CheckStatus::Checking) {
+                "◌" // Special spinner for checking state
+            } else {
+                health.symbol()
+            },
+            match self {
+                CheckStatus::Pass => Color::Green,
+                CheckStatus::Warn => Color::Yellow,
+                CheckStatus::Fail => Color::Red,
+                CheckStatus::Unknown => Color::DarkGray,
+                CheckStatus::Checking => Color::Cyan,
+            },
+        )
+    }
+}
+
+impl HasHealth for CheckStatus {
+    fn health(&self) -> HealthIndicator {
         match self {
-            CheckStatus::Pass => ("●", Color::Green),
-            CheckStatus::Warn => ("◐", Color::Yellow),
-            CheckStatus::Fail => ("✗", Color::Red),
-            CheckStatus::Unknown => ("?", Color::DarkGray),
-            CheckStatus::Checking => ("◌", Color::Cyan),
+            CheckStatus::Pass => HealthIndicator::Healthy,
+            CheckStatus::Warn => HealthIndicator::Warning,
+            CheckStatus::Fail => HealthIndicator::Error,
+            CheckStatus::Unknown => HealthIndicator::Unknown,
+            CheckStatus::Checking => HealthIndicator::Pending,
         }
     }
 }

@@ -15,6 +15,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
+use talos_pilot_core::format_bytes;
 use talos_rs::{
     get_kubespan_peers, is_kubespan_enabled, ConnectionCounts, ConnectionInfo, ConnectionState,
     KubeSpanPeerStatus, NetDevRate, NetDevStats, NetstatFilter, ServiceInfo, TalosClient,
@@ -2006,18 +2007,6 @@ impl NetworkStatsComponent {
     }
 }
 
-/// Format bytes to human-readable string
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
 
 impl NetworkStatsComponent {
     /// Handle key events in Interfaces view

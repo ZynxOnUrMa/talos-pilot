@@ -15,6 +15,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
+use talos_pilot_core::format_bytes_compact;
 use talos_rs::{CpuStat, ProcessInfo, ProcessState, TalosClient};
 
 /// Auto-refresh interval in seconds
@@ -584,22 +585,6 @@ impl ProcessesComponent {
         }
     }
 
-    /// Format bytes into human-readable string
-    fn format_bytes(bytes: u64) -> String {
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        const GB: u64 = MB * 1024;
-
-        if bytes >= GB {
-            format!("{:.1}G", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.0}M", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.0}K", bytes as f64 / KB as f64)
-        } else {
-            format!("{}B", bytes)
-        }
-    }
 
     /// Draw the header
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -627,7 +612,7 @@ impl ProcessesComponent {
             String::new()
         };
         let mem_info = if self.total_memory > 0 {
-            format!("{} RAM", Self::format_bytes(self.total_memory))
+            format!("{} RAM", format_bytes_compact(self.total_memory))
         } else {
             String::new()
         };

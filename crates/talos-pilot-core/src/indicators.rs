@@ -182,37 +182,57 @@ impl From<ConnectionState> for HealthIndicator {
 /// Quorum state for clustered services (etcd, etc.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuorumState {
-    /// Cluster has full quorum
+    /// Cluster has full quorum - all members healthy
     Healthy,
     /// Cluster is degraded but has quorum
-    Degraded {
-        healthy: usize,
-        total: usize,
-    },
-    /// Cluster has lost quorum
-    NoQuorum {
-        healthy: usize,
-        required: usize,
-    },
+    Degraded { healthy: usize, total: usize },
+    /// Cluster has lost quorum - critical
+    NoQuorum { healthy: usize, total: usize },
+    /// Unknown state (loading or error)
+    Unknown,
 }
 
 impl QuorumState {
     /// Calculate quorum state from member counts
     pub fn from_counts(healthy: usize, total: usize) -> Self {
+        if total == 0 {
+            return QuorumState::Unknown;
+        }
+
         let required = (total / 2) + 1;
 
-        if healthy == total && total > 0 {
+        if healthy == total {
             QuorumState::Healthy
         } else if healthy >= required {
             QuorumState::Degraded { healthy, total }
         } else {
-            QuorumState::NoQuorum { healthy, required }
+            QuorumState::NoQuorum { healthy, total }
         }
     }
 
     /// Check if quorum is maintained
     pub fn has_quorum(&self) -> bool {
         matches!(self, QuorumState::Healthy | QuorumState::Degraded { .. })
+    }
+
+    /// Get display text and color hint for the quorum state
+    pub fn display(&self) -> (&'static str, &'static str) {
+        match self {
+            QuorumState::Healthy => ("HEALTHY", "green"),
+            QuorumState::Degraded { .. } => ("DEGRADED", "yellow"),
+            QuorumState::NoQuorum { .. } => ("NO QUORUM", "red"),
+            QuorumState::Unknown => ("UNKNOWN", "gray"),
+        }
+    }
+
+    /// Get member count as "healthy/total" string
+    pub fn member_count_display(&self) -> String {
+        match self {
+            QuorumState::Healthy => "?/?".to_string(), // Caller should use actual counts
+            QuorumState::Degraded { healthy, total } => format!("{}/{}", healthy, total),
+            QuorumState::NoQuorum { healthy, total } => format!("{}/{}", healthy, total),
+            QuorumState::Unknown => "?/?".to_string(),
+        }
     }
 }
 
@@ -222,16 +242,14 @@ impl HasHealth for QuorumState {
             QuorumState::Healthy => HealthIndicator::Healthy,
             QuorumState::Degraded { .. } => HealthIndicator::Warning,
             QuorumState::NoQuorum { .. } => HealthIndicator::Error,
+            QuorumState::Unknown => HealthIndicator::Unknown,
         }
     }
 }
 
 impl Default for QuorumState {
     fn default() -> Self {
-        QuorumState::NoQuorum {
-            healthy: 0,
-            required: 1,
-        }
+        QuorumState::Unknown
     }
 }
 
@@ -302,6 +320,12 @@ mod tests {
 
     #[test]
     fn test_quorum_state_from_counts() {
+        // Empty cluster
+        assert!(matches!(
+            QuorumState::from_counts(0, 0),
+            QuorumState::Unknown
+        ));
+
         // 3-node cluster
         assert!(matches!(
             QuorumState::from_counts(3, 3),

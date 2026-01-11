@@ -13,8 +13,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
-use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
 use std::time::Instant;
+use talos_pilot_core::{format_bytes_signed, HasHealth, QuorumState};
+use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
 
 /// Combined etcd member data (from member list + status)
 #[derive(Debug, Clone)]
@@ -25,38 +26,37 @@ pub struct EtcdMember {
     pub status: Option<EtcdMemberStatus>,
 }
 
-/// Quorum state of the etcd cluster
-#[derive(Debug, Clone, PartialEq)]
-pub enum QuorumState {
-    /// All members healthy
-    Healthy,
-    /// Some members down but quorum maintained
-    Degraded { healthy: usize, total: usize },
-    /// Quorum lost - critical
-    NoQuorum { healthy: usize, total: usize },
-    /// Unknown state (loading or error)
-    Unknown,
+/// Extension trait to add Color conversion for QuorumState
+trait QuorumStateExt {
+    fn indicator_with_color(&self) -> (&'static str, Color);
+    fn display_with_color(&self) -> (&'static str, Color);
 }
 
-impl QuorumState {
-    /// Get display text for the quorum state
-    pub fn display(&self) -> (&'static str, Color) {
-        match self {
-            QuorumState::Healthy => ("HEALTHY", Color::Green),
-            QuorumState::Degraded { .. } => ("DEGRADED", Color::Yellow),
-            QuorumState::NoQuorum { .. } => ("NO QUORUM", Color::Red),
-            QuorumState::Unknown => ("UNKNOWN", Color::DarkGray),
-        }
+impl QuorumStateExt for QuorumState {
+    fn indicator_with_color(&self) -> (&'static str, Color) {
+        let indicator = self.health();
+        (
+            indicator.symbol(),
+            match self {
+                QuorumState::Healthy => Color::Green,
+                QuorumState::Degraded { .. } => Color::Yellow,
+                QuorumState::NoQuorum { .. } => Color::Red,
+                QuorumState::Unknown => Color::DarkGray,
+            },
+        )
     }
 
-    /// Get the status indicator
-    pub fn indicator(&self) -> (&'static str, Color) {
-        match self {
-            QuorumState::Healthy => ("●", Color::Green),
-            QuorumState::Degraded { .. } => ("◐", Color::Yellow),
-            QuorumState::NoQuorum { .. } => ("✗", Color::Red),
-            QuorumState::Unknown => ("?", Color::DarkGray),
-        }
+    fn display_with_color(&self) -> (&'static str, Color) {
+        let (text, _) = self.display();
+        (
+            text,
+            match self {
+                QuorumState::Healthy => Color::Green,
+                QuorumState::Degraded { .. } => Color::Yellow,
+                QuorumState::NoQuorum { .. } => Color::Red,
+                QuorumState::Unknown => Color::DarkGray,
+            },
+        )
     }
 }
 
@@ -240,15 +240,7 @@ impl EtcdComponent {
     fn calculate_quorum_state(&mut self) {
         let total = self.members.len();
         let healthy = self.members.iter().filter(|m| m.status.is_some()).count();
-        let quorum_needed = total / 2 + 1;
-
-        self.quorum_state = if healthy == total {
-            QuorumState::Healthy
-        } else if healthy >= quorum_needed {
-            QuorumState::Degraded { healthy, total }
-        } else {
-            QuorumState::NoQuorum { healthy, total }
-        };
+        self.quorum_state = QuorumState::from_counts(healthy, total);
     }
 
     /// Calculate total DB size and revision
@@ -345,27 +337,11 @@ impl EtcdComponent {
         }
     }
 
-    /// Format bytes for display
-    fn format_bytes(bytes: i64) -> String {
-        const KB: i64 = 1024;
-        const MB: i64 = KB * 1024;
-        const GB: i64 = MB * 1024;
-
-        if bytes >= GB {
-            format!("{:.1} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.1} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.1} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
 
     /// Draw the status bar
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let (indicator, color) = self.quorum_state.indicator();
-        let (state_text, _) = self.quorum_state.display();
+        let (indicator, color) = self.quorum_state.indicator_with_color();
+        let (state_text, _) = self.quorum_state.display_with_color();
 
         let member_count = match &self.quorum_state {
             QuorumState::Healthy => format!("{}/{}", self.members.len(), self.members.len()),
@@ -374,7 +350,7 @@ impl EtcdComponent {
             QuorumState::Unknown => "?/?".to_string(),
         };
 
-        let db_size = Self::format_bytes(self.total_db_size);
+        let db_size = format_bytes_signed(self.total_db_size);
 
         let line = Line::from(vec![
             Span::styled(format!("{} ", indicator), Style::default().fg(color)),
@@ -404,7 +380,7 @@ impl EtcdComponent {
                 let db_size = member
                     .status
                     .as_ref()
-                    .map(|s| Self::format_bytes(s.db_size))
+                    .map(|s| format_bytes_signed(s.db_size))
                     .unwrap_or_else(|| "-".to_string());
 
                 let raft_idx = member
@@ -493,7 +469,7 @@ impl EtcdComponent {
         let content = if let Some(status) = &member.status {
             let peer_url = member.info.peer_urls.first().cloned().unwrap_or_default();
             let client_url = member.info.client_urls.first().cloned().unwrap_or_default();
-            let db_in_use = Self::format_bytes(status.db_size_in_use);
+            let db_in_use = format_bytes_signed(status.db_size_in_use);
             let db_percent = if status.db_size > 0 {
                 (status.db_size_in_use as f64 / status.db_size as f64 * 100.0) as u32
             } else {
