@@ -17,8 +17,7 @@ use ratatui::{
     Frame,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use talos_pilot_core::SafetyStatus;
+use talos_pilot_core::{AsyncState, SafetyStatus};
 use talos_rs::TalosClient;
 use tokio::task::JoinHandle;
 
@@ -453,6 +452,19 @@ async fn run_reboot_operation(
     }
 }
 
+/// Async-loaded data for node operations
+#[derive(Debug, Clone, Default)]
+pub struct NodeOperationsData {
+    /// etcd info for this node
+    pub etcd_info: Option<NodeEtcdInfo>,
+    /// PDB health info
+    pub pdb_info: Option<PdbHealthInfo>,
+    /// Overall reboot safety status
+    pub reboot_safety: SafetyStatus,
+    /// Overall drain safety status
+    pub drain_safety: SafetyStatus,
+}
+
 /// Node operations overlay component
 pub struct NodeOperationsComponent {
     /// Node hostname
@@ -467,22 +479,8 @@ pub struct NodeOperationsComponent {
     /// K8s client for PDB checks
     k8s_client: Option<Client>,
 
-    /// etcd info for this node
-    etcd_info: Option<NodeEtcdInfo>,
-    /// PDB health info
-    pdb_info: Option<PdbHealthInfo>,
-
-    /// Overall reboot safety status
-    reboot_safety: SafetyStatus,
-    /// Overall drain safety status
-    drain_safety: SafetyStatus,
-
-    /// Loading state
-    loading: bool,
-    /// Error message
-    error: Option<String>,
-    /// Last refresh time
-    last_refresh: Option<Instant>,
+    /// Async state for loaded data
+    state: AsyncState<NodeOperationsData>,
 
     /// Selected operation index
     selected_op: usize,
@@ -513,19 +511,23 @@ impl NodeOperationsComponent {
             is_controlplane,
             client: None,
             k8s_client: None,
-            etcd_info: None,
-            pdb_info: None,
-            reboot_safety: SafetyStatus::Unknown,
-            drain_safety: SafetyStatus::Unknown,
-            loading: true,
-            error: None,
-            last_refresh: None,
+            state: AsyncState::new(),
             selected_op: 0,
             operation_state: OperationState::Ready,
             operation_task: None,
             operation_progress: Arc::new(Mutex::new(OperationProgress::default())),
             drain_options: DrainOptions::default(),
         }
+    }
+
+    /// Get a reference to the loaded data
+    fn data(&self) -> Option<&NodeOperationsData> {
+        self.state.data()
+    }
+
+    /// Get a mutable reference to the loaded data
+    fn data_mut(&mut self) -> Option<&mut NodeOperationsData> {
+        self.state.data_mut()
     }
 
     /// Get a mutable reference to drain options for configuration
@@ -540,8 +542,7 @@ impl NodeOperationsComponent {
 
     /// Set error message
     pub fn set_error(&mut self, error: String) {
-        self.error = Some(error);
-        self.loading = false;
+        self.state.set_error(error);
     }
 
     /// Poll background operation and update progress
@@ -622,12 +623,15 @@ impl NodeOperationsComponent {
             return Ok(());
         }
 
-        self.loading = true;
-        self.error = None;
+        self.state.start_loading();
+
+        // Ensure we have data to update
+        if self.state.data().is_none() {
+            self.state.set_data(NodeOperationsData::default());
+        }
 
         let Some(client) = self.client.clone() else {
-            self.error = Some("No client configured".to_string());
-            self.loading = false;
+            self.state.set_error("No client configured");
             return Ok(());
         };
 
@@ -636,10 +640,12 @@ impl NodeOperationsComponent {
             self.fetch_etcd_info(&client).await;
         } else {
             // Worker nodes are not etcd members
-            self.etcd_info = Some(NodeEtcdInfo {
-                is_member: false,
-                ..Default::default()
-            });
+            if let Some(data) = self.data_mut() {
+                data.etcd_info = Some(NodeEtcdInfo {
+                    is_member: false,
+                    ..Default::default()
+                });
+            }
         }
 
         // Fetch PDB info
@@ -648,8 +654,7 @@ impl NodeOperationsComponent {
         // Calculate overall safety status
         self.calculate_safety_status();
 
-        self.loading = false;
-        self.last_refresh = Some(Instant::now());
+        self.state.mark_loaded();
         Ok(())
     }
 
@@ -697,19 +702,23 @@ impl NodeOperationsComponent {
                     Err(_) => total, // Assume all healthy if can't get status
                 };
 
-                self.etcd_info = Some(NodeEtcdInfo {
-                    is_member,
-                    is_leader,
-                    total_members: total,
-                    healthy_members: healthy,
-                    quorum_needed,
-                    members_after,
-                    quorum_maintained,
-                });
+                if let Some(data) = self.data_mut() {
+                    data.etcd_info = Some(NodeEtcdInfo {
+                        is_member,
+                        is_leader,
+                        total_members: total,
+                        healthy_members: healthy,
+                        quorum_needed,
+                        members_after,
+                        quorum_maintained,
+                    });
+                }
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch etcd members: {}", e);
-                self.etcd_info = None;
+                if let Some(data) = self.data_mut() {
+                    data.etcd_info = None;
+                }
             }
         }
     }
@@ -733,7 +742,9 @@ impl NodeOperationsComponent {
         if let Some(k8s) = &self.k8s_client {
             match check_pdb_health(k8s).await {
                 Ok(info) => {
-                    self.pdb_info = Some(info);
+                    if let Some(data) = self.data_mut() {
+                        data.pdb_info = Some(info);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to fetch PDB info: {}", e);
@@ -744,14 +755,16 @@ impl NodeOperationsComponent {
 
     /// Calculate overall safety status
     fn calculate_safety_status(&mut self) {
+        let Some(data) = self.data_mut() else { return };
+
         // Reboot safety = etcd safety (for CP) + drain safety
-        let etcd_safety = self.etcd_info
+        let etcd_safety = data.etcd_info
             .as_ref()
             .map(|e| e.safety_status())
             .unwrap_or(SafetyStatus::Unknown);
 
         // Drain safety = PDB check
-        self.drain_safety = if let Some(ref pdb) = self.pdb_info {
+        data.drain_safety = if let Some(ref pdb) = data.pdb_info {
             if pdb.has_blocking_pdbs() {
                 SafetyStatus::Warning(format!(
                     "{} PDB(s) would block drain",
@@ -765,7 +778,7 @@ impl NodeOperationsComponent {
         };
 
         // Reboot safety combines etcd and drain
-        self.reboot_safety = match (&etcd_safety, &self.drain_safety) {
+        data.reboot_safety = match (&etcd_safety, &data.drain_safety) {
             (SafetyStatus::Unsafe(msg), _) => SafetyStatus::Unsafe(msg.clone()),
             (_, SafetyStatus::Unsafe(msg)) => SafetyStatus::Unsafe(msg.clone()),
             (SafetyStatus::Warning(msg), _) => SafetyStatus::Warning(msg.clone()),
@@ -966,6 +979,9 @@ impl NodeOperationsComponent {
         // Clear the background
         frame.render_widget(Clear, overlay_area);
 
+        // Get data for rendering
+        let data = self.data();
+
         // Build content
         let mut lines = Vec::new();
 
@@ -990,7 +1006,7 @@ impl NodeOperationsComponent {
                 Span::styled("  etcd Status", Style::default().fg(Color::Yellow)),
             ]));
 
-            if let Some(ref etcd) = self.etcd_info {
+            if let Some(ref etcd) = data.and_then(|d| d.etcd_info.as_ref()) {
                 let (indicator, color) = etcd.safety_status().indicator_with_color();
                 let role = if etcd.is_leader { "leader" } else { "member" };
 
@@ -1026,8 +1042,9 @@ impl NodeOperationsComponent {
             Span::styled("  Drain Safety", Style::default().fg(Color::Yellow)),
         ]));
 
-        if let Some(ref pdb) = self.pdb_info {
-            let (indicator, color) = self.drain_safety.indicator_with_color();
+        if let Some(ref pdb) = data.and_then(|d| d.pdb_info.as_ref()) {
+            let drain_safety = data.map(|d| &d.drain_safety).unwrap_or(&SafetyStatus::Unknown);
+            let (indicator, color) = drain_safety.indicator_with_color();
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(indicator, Style::default().fg(color)),
@@ -1067,7 +1084,8 @@ impl NodeOperationsComponent {
         ]));
 
         // Reboot operation
-        let (reboot_ind, reboot_color) = self.reboot_safety.indicator_with_color();
+        let reboot_safety = data.map(|d| &d.reboot_safety).unwrap_or(&SafetyStatus::Unknown);
+        let (reboot_ind, reboot_color) = reboot_safety.indicator_with_color();
         let reboot_style = if self.selected_op == 0 {
             Style::default().fg(reboot_color).add_modifier(Modifier::REVERSED)
         } else {
@@ -1080,7 +1098,8 @@ impl NodeOperationsComponent {
         ]));
 
         // Drain operation
-        let (drain_ind, drain_color) = self.drain_safety.indicator_with_color();
+        let drain_safety = data.map(|d| &d.drain_safety).unwrap_or(&SafetyStatus::Unknown);
+        let (drain_ind, drain_color) = drain_safety.indicator_with_color();
         let drain_style = if self.selected_op == 1 {
             Style::default().fg(drain_color).add_modifier(Modifier::REVERSED)
         } else {
@@ -1130,10 +1149,13 @@ impl Component for NodeOperationsComponent {
                     }
                     KeyCode::Enter => {
                         // Trigger the selected operation
+                        let reboot_unsafe = self.data()
+                            .map(|d| matches!(d.reboot_safety, SafetyStatus::Unsafe(_)))
+                            .unwrap_or(true);
                         match self.selected_op {
                             0 => {
                                 // Reboot
-                                if matches!(self.reboot_safety, SafetyStatus::Unsafe(_)) {
+                                if reboot_unsafe {
                                     tracing::warn!("Reboot blocked due to unsafe status");
                                     Ok(None)
                                 } else {
@@ -1151,7 +1173,10 @@ impl Component for NodeOperationsComponent {
                     }
                     KeyCode::Char('r') => {
                         // Check safety before allowing
-                        if matches!(self.reboot_safety, SafetyStatus::Unsafe(_)) {
+                        let reboot_unsafe = self.data()
+                            .map(|d| matches!(d.reboot_safety, SafetyStatus::Unsafe(_)))
+                            .unwrap_or(true);
+                        if reboot_unsafe {
                             // Don't allow unsafe operations without explicit override
                             tracing::warn!("Reboot blocked due to unsafe status");
                             Ok(None)
@@ -1205,7 +1230,7 @@ impl Component for NodeOperationsComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        if self.loading && self.etcd_info.is_none() {
+        if self.state.is_loading() && self.data().map(|d| d.etcd_info.is_none()).unwrap_or(true) {
             // Show loading in overlay
             let overlay_width = 40.min(area.width.saturating_sub(4));
             let overlay_height = 5;
