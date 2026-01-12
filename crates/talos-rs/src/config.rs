@@ -97,8 +97,24 @@ impl Context {
         self.endpoints.first().map(|e| {
             if e.starts_with("https://") || e.starts_with("http://") {
                 e.clone()
-            } else {
+            } else if e.starts_with('[') {
+                // IPv6 address with brackets - check if port is specified
+                if e.contains("]:") {
+                    // Has port specified: [::1]:50000
+                    format!("https://{}", e)
+                } else {
+                    // No port: [::1] -> add default port
+                    format!("https://{}:50000", e)
+                }
+            } else if e.contains("::") || e.matches(':').count() > 1 {
+                // Raw IPv6 address without brackets - add brackets and default port
+                format!("https://[{}]:50000", e)
+            } else if e.contains(':') {
+                // IPv4 or hostname with port specified
                 format!("https://{}", e)
+            } else {
+                // IPv4 or hostname without port - add default Talos API port
+                format!("https://{}:50000", e)
             }
         })
     }
@@ -161,6 +177,7 @@ contexts:
 
     #[test]
     fn test_endpoint_url() {
+        // Test endpoint with explicit port
         let ctx = Context {
             endpoints: vec!["192.168.1.100:50000".to_string()],
             nodes: vec![],
@@ -172,5 +189,153 @@ contexts:
             ctx.endpoint_url(),
             Some("https://192.168.1.100:50000".to_string())
         );
+
+        let ctx2 = Context {
+            endpoints: vec!["kharkiv".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx2.endpoint_url(),
+            Some("https://kharkiv:50000".to_string())
+        );
+
+        let ctx3 = Context {
+            endpoints: vec!["https://192.168.1.100:50000".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx3.endpoint_url(),
+            Some("https://192.168.1.100:50000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_endpoint_url_with_ipv6() {
+        // IPv6 with brackets and port
+        let ctx = Context {
+            endpoints: vec!["[2a01:e0a:e4b:aa30::1]:50000".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx.endpoint_url(),
+            Some("https://[2a01:e0a:e4b:aa30::1]:50000".to_string())
+        );
+
+        // Raw IPv6 without brackets - should add brackets and default port
+        let ctx2 = Context {
+            endpoints: vec!["2a01:e0a:e4b:aa30::1".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx2.endpoint_url(),
+            Some("https://[2a01:e0a:e4b:aa30::1]:50000".to_string())
+        );
+
+        // IPv6 with brackets and port
+        let ctx3 = Context {
+            endpoints: vec!["[::1]:50000".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(ctx3.endpoint_url(), Some("https://[::1]:50000".to_string()));
+
+        // IPv6 with brackets but no port - should add default port
+        let ctx4 = Context {
+            endpoints: vec!["[::1]".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(ctx4.endpoint_url(), Some("https://[::1]:50000".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_url_with_custom_port() {
+        let ctx = Context {
+            endpoints: vec!["192.168.1.100:443".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx.endpoint_url(),
+            Some("https://192.168.1.100:443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_endpoint_url_with_hostname() {
+        let ctx = Context {
+            endpoints: vec!["talos.example.com".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx.endpoint_url(),
+            Some("https://talos.example.com:50000".to_string())
+        );
+
+        let ctx2 = Context {
+            endpoints: vec!["talos.example.com:8443".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx2.endpoint_url(),
+            Some("https://talos.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_target_nodes_fallback() {
+        let ctx = Context {
+            endpoints: vec!["192.168.1.100:50000".to_string()],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(ctx.target_nodes(), &["192.168.1.100:50000"]);
+
+        let ctx2 = Context {
+            endpoints: vec!["127.0.0.1:50000".to_string()],
+            nodes: vec!["192.168.1.101".to_string(), "192.168.1.102".to_string()],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(ctx2.target_nodes(), &["192.168.1.101", "192.168.1.102"]);
+    }
+
+    #[test]
+    fn test_empty_endpoints() {
+        let ctx = Context {
+            endpoints: vec![],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(ctx.endpoint_url(), None);
     }
 }
