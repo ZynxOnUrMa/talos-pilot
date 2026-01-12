@@ -15,7 +15,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
-use talos_pilot_core::format_bytes;
+use talos_pilot_core::{format_bytes, AsyncState};
 use talos_rs::{
     get_kubespan_peers, is_kubespan_enabled, ConnectionCounts, ConnectionInfo, ConnectionState,
     KubeSpanPeerStatus, NetDevRate, NetDevStats, NetstatFilter, ServiceInfo, TalosClient,
@@ -173,6 +173,42 @@ impl Default for CaptureData {
     }
 }
 
+/// Async-loaded network data
+#[derive(Debug, Clone, Default)]
+pub struct NetworkData {
+    /// Current device statistics
+    pub devices: Vec<NetDevStats>,
+    /// Previous device stats (for rate calculation)
+    pub prev_devices: HashMap<String, NetDevStats>,
+    /// Calculated rates per device
+    pub rates: HashMap<String, NetDevRate>,
+    /// Time of last sample
+    pub last_sample: Option<Instant>,
+
+    /// Total RX rate (bytes/sec)
+    pub total_rx_rate: u64,
+    /// Total TX rate (bytes/sec)
+    pub total_tx_rate: u64,
+    /// Total errors across all devices
+    pub total_errors: u64,
+    /// Total dropped across all devices
+    pub total_dropped: u64,
+
+    /// Connection data from netstat
+    pub connections: Vec<ConnectionInfo>,
+    /// Connection counts by state
+    pub conn_counts: ConnectionCounts,
+    /// Service health status (port -> is_healthy)
+    pub service_health: HashMap<u16, bool>,
+    /// Service info from services API (service_id -> ServiceInfo)
+    pub services: HashMap<String, ServiceInfo>,
+
+    /// KubeSpan peer status data
+    pub kubespan_peers: Vec<KubeSpanPeerStatus>,
+    /// KubeSpan enabled status
+    pub kubespan_enabled: Option<bool>,
+}
+
 /// Network stats component for viewing node network interfaces
 pub struct NetworkStatsComponent {
     /// Node hostname
@@ -180,14 +216,8 @@ pub struct NetworkStatsComponent {
     /// Node address
     address: String,
 
-    /// Current device statistics
-    devices: Vec<NetDevStats>,
-    /// Previous device stats (for rate calculation)
-    prev_devices: HashMap<String, NetDevStats>,
-    /// Calculated rates per device
-    rates: HashMap<String, NetDevRate>,
-    /// Time of last sample
-    last_sample: Option<Instant>,
+    /// Async state for loaded data
+    state: AsyncState<NetworkData>,
 
     /// Selected device index
     selected: usize,
@@ -196,33 +226,8 @@ pub struct NetworkStatsComponent {
     /// Current sort order
     sort_by: SortBy,
 
-    /// Total RX rate (bytes/sec)
-    total_rx_rate: u64,
-    /// Total TX rate (bytes/sec)
-    total_tx_rate: u64,
-    /// Total errors across all devices
-    total_errors: u64,
-    /// Total dropped across all devices
-    total_dropped: u64,
-
-    /// Connection data from netstat
-    connections: Vec<ConnectionInfo>,
-    /// Connection counts by state
-    conn_counts: ConnectionCounts,
-    /// Service health status (port -> is_healthy)
-    service_health: HashMap<u16, bool>,
-    /// Service info from services API (service_id -> ServiceInfo)
-    services: HashMap<String, ServiceInfo>,
-
-    /// Loading state
-    loading: bool,
-    /// Error message
-    error: Option<String>,
-
     /// Auto-refresh enabled
     auto_refresh: bool,
-    /// Last refresh time
-    last_refresh: Option<Instant>,
 
     /// Current view mode (Interfaces or Connections drill-down)
     view_mode: ViewMode,
@@ -267,10 +272,6 @@ pub struct NetworkStatsComponent {
     /// Client for API calls
     client: Option<TalosClient>,
 
-    /// KubeSpan peer status data
-    kubespan_peers: Vec<KubeSpanPeerStatus>,
-    /// KubeSpan enabled status
-    kubespan_enabled: Option<bool>,
     /// Selected KubeSpan peer index
     kubespan_selected: usize,
     /// KubeSpan table state
@@ -293,25 +294,11 @@ impl NetworkStatsComponent {
         Self {
             hostname,
             address,
-            devices: Vec::new(),
-            prev_devices: HashMap::new(),
-            rates: HashMap::new(),
-            last_sample: None,
+            state: AsyncState::new(),
             selected: 0,
             table_state,
             sort_by: SortBy::Traffic,
-            total_rx_rate: 0,
-            total_tx_rate: 0,
-            total_errors: 0,
-            total_dropped: 0,
-            connections: Vec::new(),
-            conn_counts: ConnectionCounts::default(),
-            service_health: HashMap::new(),
-            services: HashMap::new(),
-            loading: true,
-            error: None,
             auto_refresh: true,
-            last_refresh: None,
             view_mode: ViewMode::Interfaces,
             selected_interface: None,
             filtered_connections: Vec::new(),
@@ -330,8 +317,6 @@ impl NetworkStatsComponent {
             file_viewer: None,
             capture: CaptureData::default(),
             client: None,
-            kubespan_peers: Vec::new(),
-            kubespan_enabled: None,
             kubespan_selected: 0,
             kubespan_table_state: {
                 let mut state = TableState::default();
@@ -341,6 +326,16 @@ impl NetworkStatsComponent {
         }
     }
 
+    /// Get a reference to the loaded data
+    fn data(&self) -> Option<&NetworkData> {
+        self.state.data()
+    }
+
+    /// Get a mutable reference to the loaded data
+    fn data_mut(&mut self) -> Option<&mut NetworkData> {
+        self.state.data_mut()
+    }
+
     /// Set the client for API calls
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
@@ -348,18 +343,22 @@ impl NetworkStatsComponent {
 
     /// Set error message
     pub fn set_error(&mut self, error: String) {
-        self.error = Some(error);
-        self.loading = false;
+        self.state.set_error(error);
     }
 
     /// Refresh network data from the node
     pub async fn refresh(&mut self) -> Result<()> {
-        let Some(client) = &self.client else {
+        let Some(client) = self.client.clone() else {
             self.set_error("No client configured".to_string());
             return Ok(());
         };
 
-        self.loading = true;
+        self.state.start_loading();
+
+        // Ensure we have data to update
+        if self.state.data().is_none() {
+            self.state.set_data(NetworkData::default());
+        }
 
         let timeout = std::time::Duration::from_secs(10);
 
@@ -379,9 +378,9 @@ impl NetworkStatsComponent {
             Ok(Ok(stats)) => {
                 if let Some(node_data) = stats.into_iter().next() {
                     self.update_devices(node_data.devices);
-                } else {
-                    self.devices.clear();
-                    self.rates.clear();
+                } else if let Some(data) = self.data_mut() {
+                    data.devices.clear();
+                    data.rates.clear();
                 }
             }
             Ok(Err(e)) => {
@@ -399,20 +398,24 @@ impl NetworkStatsComponent {
             Ok(Ok(conn_data)) => {
                 if let Some(node_conns) = conn_data.into_iter().next() {
                     self.update_connections(node_conns.connections);
-                } else {
-                    self.connections.clear();
-                    self.conn_counts = ConnectionCounts::default();
+                } else if let Some(data) = self.data_mut() {
+                    data.connections.clear();
+                    data.conn_counts = ConnectionCounts::default();
                 }
             }
             Ok(Err(_)) => {
                 // Silently ignore netstat errors - interface data still useful
-                self.connections.clear();
-                self.conn_counts = ConnectionCounts::default();
+                if let Some(data) = self.data_mut() {
+                    data.connections.clear();
+                    data.conn_counts = ConnectionCounts::default();
+                }
             }
             Err(_) => {
                 // Timeout on netstat - continue with interface data
-                self.connections.clear();
-                self.conn_counts = ConnectionCounts::default();
+                if let Some(data) = self.data_mut() {
+                    data.connections.clear();
+                    data.conn_counts = ConnectionCounts::default();
+                }
             }
         }
 
@@ -420,17 +423,21 @@ impl NetworkStatsComponent {
         match svc_result {
             Ok(Ok(svc_data)) => {
                 if let Some(node_svcs) = svc_data.into_iter().next() {
-                    self.services = node_svcs.services
-                        .into_iter()
-                        .map(|s| (s.id.clone(), s))
-                        .collect();
-                } else {
-                    self.services.clear();
+                    if let Some(data) = self.data_mut() {
+                        data.services = node_svcs.services
+                            .into_iter()
+                            .map(|s| (s.id.clone(), s))
+                            .collect();
+                    }
+                } else if let Some(data) = self.data_mut() {
+                    data.services.clear();
                 }
             }
             Ok(Err(_)) | Err(_) => {
                 // Silently ignore service errors
-                self.services.clear();
+                if let Some(data) = self.data_mut() {
+                    data.services.clear();
+                }
             }
         }
 
@@ -441,14 +448,13 @@ impl NetworkStatsComponent {
         self.refresh_kubespan_data().await;
 
         // Reset selection if needed
-        if !self.devices.is_empty() && self.selected >= self.devices.len() {
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 && self.selected >= device_count {
             self.selected = 0;
         }
         self.table_state.select(Some(self.selected));
 
-        self.loading = false;
-        self.error = None;
-        self.last_refresh = Some(Instant::now());
+        self.state.mark_loaded();
 
         Ok(())
     }
@@ -475,11 +481,14 @@ impl NetworkStatsComponent {
 
         match result {
             Ok((enabled, peers)) => {
-                self.kubespan_enabled = enabled;
-                self.kubespan_peers = peers;
+                if let Some(data) = self.data_mut() {
+                    data.kubespan_enabled = enabled;
+                    data.kubespan_peers = peers;
+                }
 
                 // Reset selection if needed
-                if !self.kubespan_peers.is_empty() && self.kubespan_selected >= self.kubespan_peers.len() {
+                let peer_count = self.data().map(|d| d.kubespan_peers.len()).unwrap_or(0);
+                if peer_count > 0 && self.kubespan_selected >= peer_count {
                     self.kubespan_selected = 0;
                 }
                 self.kubespan_table_state.select(Some(self.kubespan_selected));
@@ -492,69 +501,75 @@ impl NetworkStatsComponent {
 
     /// Update connections and calculate counts
     fn update_connections(&mut self, connections: Vec<ConnectionInfo>) {
-        self.conn_counts = ConnectionCounts::count_by_state(&connections);
-        self.connections = connections;
+        if let Some(data) = self.data_mut() {
+            data.conn_counts = ConnectionCounts::count_by_state(&connections);
+            data.connections = connections;
+        }
     }
 
     /// Update service health indicators based on connection data
     fn update_service_health(&mut self) {
-        self.service_health.clear();
+        let Some(data) = self.data_mut() else { return };
+        data.service_health.clear();
 
         // Key ports to monitor for Kubernetes
         let key_ports: &[u16] = &[6443, 2379, 10250, 10259, 10257];
 
         for port in key_ports {
             // Check if port is listening
-            let is_listening = self.connections.iter().any(|c| {
+            let is_listening = data.connections.iter().any(|c| {
                 c.local_port == *port as u32 && c.state == ConnectionState::Listen
             });
-            self.service_health.insert(*port, is_listening);
+            data.service_health.insert(*port, is_listening);
         }
     }
 
     /// Update devices and calculate rates
     fn update_devices(&mut self, new_devices: Vec<NetDevStats>) {
+        let sort_by = self.sort_by;
+        let Some(data) = self.data_mut() else { return };
+
         let now = Instant::now();
-        let elapsed_secs = self.last_sample
+        let elapsed_secs = data.last_sample
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
 
         // Calculate rates if we have previous data
         if elapsed_secs > 0.1 {
             for dev in &new_devices {
-                if let Some(prev) = self.prev_devices.get(&dev.name) {
+                if let Some(prev) = data.prev_devices.get(&dev.name) {
                     let rate = NetDevRate::from_delta(prev, dev, elapsed_secs);
-                    self.rates.insert(dev.name.clone(), rate);
+                    data.rates.insert(dev.name.clone(), rate);
                 }
             }
         }
 
         // Store current as previous for next calculation
-        self.prev_devices.clear();
+        data.prev_devices.clear();
         for dev in &new_devices {
-            self.prev_devices.insert(dev.name.clone(), dev.clone());
+            data.prev_devices.insert(dev.name.clone(), dev.clone());
         }
-        self.last_sample = Some(now);
+        data.last_sample = Some(now);
 
         // Calculate totals
-        self.total_rx_rate = self.rates.values().map(|r| r.rx_bytes_per_sec).sum();
-        self.total_tx_rate = self.rates.values().map(|r| r.tx_bytes_per_sec).sum();
-        self.total_errors = new_devices.iter().map(|d| d.total_errors()).sum();
-        self.total_dropped = new_devices.iter().map(|d| d.total_dropped()).sum();
+        data.total_rx_rate = data.rates.values().map(|r| r.rx_bytes_per_sec).sum();
+        data.total_tx_rate = data.rates.values().map(|r| r.tx_bytes_per_sec).sum();
+        data.total_errors = new_devices.iter().map(|d| d.total_errors()).sum();
+        data.total_dropped = new_devices.iter().map(|d| d.total_dropped()).sum();
 
         // Sort and store devices
-        self.devices = new_devices;
-        self.sort_devices();
+        data.devices = new_devices;
+        Self::sort_devices_by(data, sort_by);
     }
 
-    /// Sort devices based on current sort order
-    fn sort_devices(&mut self) {
-        match self.sort_by {
+    /// Sort devices based on sort order (static helper to avoid borrow issues)
+    fn sort_devices_by(data: &mut NetworkData, sort_by: SortBy) {
+        match sort_by {
             SortBy::Traffic => {
                 // Sort by rate if available, otherwise by cumulative traffic
-                self.devices.sort_by(|a, b| {
-                    let rate_a = self.rates.get(&a.name).map(|r| r.total_rate()).unwrap_or(0);
-                    let rate_b = self.rates.get(&b.name).map(|r| r.total_rate()).unwrap_or(0);
+                data.devices.sort_by(|a, b| {
+                    let rate_a = data.rates.get(&a.name).map(|r| r.total_rate()).unwrap_or(0);
+                    let rate_b = data.rates.get(&b.name).map(|r| r.total_rate()).unwrap_or(0);
                     if rate_a != rate_b {
                         rate_b.cmp(&rate_a)
                     } else {
@@ -563,7 +578,7 @@ impl NetworkStatsComponent {
                 });
             }
             SortBy::Errors => {
-                self.devices.sort_by(|a, b| {
+                data.devices.sort_by(|a, b| {
                     let err_a = a.total_errors() + a.total_dropped();
                     let err_b = b.total_errors() + b.total_dropped();
                     err_b.cmp(&err_a)
@@ -572,9 +587,17 @@ impl NetworkStatsComponent {
         }
     }
 
+    /// Sort devices based on current sort order
+    fn sort_devices(&mut self) {
+        let sort_by = self.sort_by;
+        let Some(data) = self.data_mut() else { return };
+        Self::sort_devices_by(data, sort_by);
+    }
+
     /// Navigate to previous device
     fn select_prev(&mut self) {
-        if !self.devices.is_empty() && self.selected > 0 {
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 && self.selected > 0 {
             self.selected -= 1;
             self.table_state.select(Some(self.selected));
         }
@@ -582,15 +605,17 @@ impl NetworkStatsComponent {
 
     /// Navigate to next device
     fn select_next(&mut self) {
-        if !self.devices.is_empty() {
-            self.selected = (self.selected + 1).min(self.devices.len() - 1);
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 {
+            self.selected = (self.selected + 1).min(device_count - 1);
             self.table_state.select(Some(self.selected));
         }
     }
 
     /// Jump to top of list
     fn select_first(&mut self) {
-        if !self.devices.is_empty() {
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 {
             self.selected = 0;
             self.table_state.select(Some(self.selected));
         }
@@ -598,35 +623,33 @@ impl NetworkStatsComponent {
 
     /// Jump to bottom of list
     fn select_last(&mut self) {
-        if !self.devices.is_empty() {
-            self.selected = self.devices.len() - 1;
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 {
+            self.selected = device_count - 1;
             self.table_state.select(Some(self.selected));
         }
     }
 
-    /// Get selected device
-    fn selected_device(&self) -> Option<&NetDevStats> {
-        self.devices.get(self.selected)
-    }
-
-    /// Get rate for a device
-    fn get_rate(&self, name: &str) -> Option<&NetDevRate> {
-        self.rates.get(name)
+    /// Get selected device name
+    fn selected_device_name(&self) -> Option<String> {
+        self.data().and_then(|d| d.devices.get(self.selected).map(|dev| dev.name.clone()))
     }
 
     /// Get filtered and sorted connections for display
     /// Uses pre-filtered connections based on selected interface
-    fn filtered_connections(&self) -> Vec<&ConnectionInfo> {
+    fn get_filtered_connections(&self) -> Vec<ConnectionInfo> {
+        let Some(data) = self.data() else { return Vec::new() };
+
         // Use the pre-filtered list (filtered by interface) unless showing all
-        let source = if self.show_all_connections || self.view_mode == ViewMode::Interfaces {
+        let source: Vec<_> = if self.show_all_connections || self.view_mode == ViewMode::Interfaces {
             // Show all connections
-            &self.connections
+            data.connections.iter().cloned().collect()
         } else {
             // In connections view, use interface-filtered list
-            &self.filtered_connections
+            self.filtered_connections.clone()
         };
 
-        let mut conns: Vec<_> = source.iter()
+        let mut conns: Vec<_> = source.into_iter()
             .filter(|c| !self.listening_only || c.state == ConnectionState::Listen)
             .collect();
 
@@ -656,7 +679,7 @@ impl NetworkStatsComponent {
 
     /// Navigate to previous connection
     fn conn_select_prev(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         if count > 0 && self.conn_selected > 0 {
             self.conn_selected -= 1;
             self.conn_table_state.select(Some(self.conn_selected));
@@ -665,7 +688,7 @@ impl NetworkStatsComponent {
 
     /// Navigate to next connection
     fn conn_select_next(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         if count > 0 {
             self.conn_selected = (self.conn_selected + 1).min(count - 1);
             self.conn_table_state.select(Some(self.conn_selected));
@@ -674,7 +697,7 @@ impl NetworkStatsComponent {
 
     /// Jump to first connection
     fn conn_select_first(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         if count > 0 {
             self.conn_selected = 0;
             self.conn_table_state.select(Some(self.conn_selected));
@@ -683,7 +706,7 @@ impl NetworkStatsComponent {
 
     /// Jump to last connection
     fn conn_select_last(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         if count > 0 {
             self.conn_selected = count - 1;
             self.conn_table_state.select(Some(self.conn_selected));
@@ -693,7 +716,7 @@ impl NetworkStatsComponent {
     /// Enter connection drill-down view for the selected interface
     fn enter_connections_view(&mut self) {
         // Store the selected interface name
-        self.selected_interface = self.selected_device().map(|d| d.name.clone());
+        self.selected_interface = self.selected_device_name();
 
         // Filter connections for this interface
         self.filter_connections_for_interface();
@@ -705,13 +728,18 @@ impl NetworkStatsComponent {
 
     /// Filter connections based on the selected interface
     fn filter_connections_for_interface(&mut self) {
-        let Some(ref iface) = self.selected_interface else {
-            // No interface selected - show all connections
-            self.filtered_connections = self.connections.clone();
+        let Some(data) = self.data() else {
+            self.filtered_connections.clear();
             return;
         };
 
-        self.filtered_connections = self.connections.iter()
+        let Some(ref iface) = self.selected_interface else {
+            // No interface selected - show all connections
+            self.filtered_connections = data.connections.clone();
+            return;
+        };
+
+        self.filtered_connections = data.connections.iter()
             .filter(|conn| Self::connection_matches_interface(conn, iface))
             .cloned()
             .collect();
@@ -787,15 +815,17 @@ impl NetworkStatsComponent {
     }
 
     /// Get service info for a listening connection (if known)
-    fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, Option<&ServiceInfo>)> {
+    fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, bool)> {
         if conn.state != ConnectionState::Listen {
             return None;
         }
 
         // Check if this port maps to a known service
         port_to_service(conn.local_port).map(|service_name| {
-            let service_info = self.services.get(service_name);
-            (service_name, service_info)
+            let has_service = self.data()
+                .map(|d| d.services.contains_key(service_name))
+                .unwrap_or(false);
+            (service_name, has_service)
         })
     }
 
@@ -844,7 +874,7 @@ impl NetworkStatsComponent {
 
     /// Yank (copy) selected connections or current connection to clipboard
     fn yank_conn_selection(&self) -> (bool, usize) {
-        let conns = self.filtered_connections();
+        let conns = self.get_filtered_connections();
 
         let lines: Vec<String> = if let Some((start, end)) = self.conn_selection_range() {
             // Yank all selected connections
@@ -880,7 +910,7 @@ impl NetworkStatsComponent {
 
     /// Page down in connection list
     fn conn_page_down(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         let page_size = self.conn_viewport_height.saturating_sub(2) as usize;
         if count > 0 {
             self.conn_selected = (self.conn_selected + page_size).min(count - 1);
@@ -897,7 +927,7 @@ impl NetworkStatsComponent {
 
     /// Half page down in connection list
     fn conn_half_page_down(&mut self) {
-        let count = self.filtered_connections().len();
+        let count = self.get_filtered_connections().len();
         let half = (self.conn_viewport_height / 2).max(1) as usize;
         if count > 0 {
             self.conn_selected = (self.conn_selected + half).min(count - 1);
@@ -907,7 +937,7 @@ impl NetworkStatsComponent {
 
     /// Draw the header
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let device_count = format!("{} ifaces", self.devices.len());
+        let device_count = format!("{} ifaces", self.data().map(|d| d.devices.len()).unwrap_or(0));
 
         let auto_indicator = if self.auto_refresh { "" } else { " [AUTO:OFF]" };
 
@@ -954,11 +984,15 @@ impl NetworkStatsComponent {
 
     /// Draw the summary bar
     fn draw_summary_bar(&self, frame: &mut Frame, area: Rect) {
-        let has_errors = self.total_errors > 0 || self.total_dropped > 0;
+        let (total_errors, total_dropped, total_rx_rate, total_tx_rate) = self.data()
+            .map(|d| (d.total_errors, d.total_dropped, d.total_rx_rate, d.total_tx_rate))
+            .unwrap_or((0, 0, 0, 0));
+
+        let has_errors = total_errors > 0 || total_dropped > 0;
         let warning = if has_errors { "! " } else { "" };
 
-        let rx_rate = NetDevStats::format_rate(self.total_rx_rate);
-        let tx_rate = NetDevStats::format_rate(self.total_tx_rate);
+        let rx_rate = NetDevStats::format_rate(total_rx_rate);
+        let tx_rate = NetDevStats::format_rate(total_tx_rate);
 
         let mut spans = vec![
             Span::styled(warning, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -972,20 +1006,20 @@ impl NetworkStatsComponent {
 
         // Add errors/dropped if any
         spans.push(Span::raw("   "));
-        let errors_style = if self.total_errors > 0 {
+        let errors_style = if total_errors > 0 {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(format!("Errors: {}", self.total_errors), errors_style));
+        spans.push(Span::styled(format!("Errors: {}", total_errors), errors_style));
 
         spans.push(Span::raw("   "));
-        let dropped_style = if self.total_dropped > 0 {
+        let dropped_style = if total_dropped > 0 {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(format!("Dropped: {}", self.total_dropped), dropped_style));
+        spans.push(Span::styled(format!("Dropped: {}", total_dropped), dropped_style));
 
         let summary = Paragraph::new(Line::from(spans));
         frame.render_widget(summary, area);
@@ -993,7 +1027,9 @@ impl NetworkStatsComponent {
 
     /// Draw the connection summary bar
     fn draw_connection_summary(&self, frame: &mut Frame, area: Rect) {
-        let cc = &self.conn_counts;
+        let cc = self.data()
+            .map(|d| d.conn_counts.clone())
+            .unwrap_or_default();
         let has_warnings = cc.has_warnings();
         let warning = if has_warnings { "! " } else { "" };
 
@@ -1052,10 +1088,14 @@ impl NetworkStatsComponent {
             ("Controller", 10257),
         ];
 
+        let service_health = self.data()
+            .map(|d| d.service_health.clone())
+            .unwrap_or_default();
+
         let mut spans = Vec::new();
 
         for (name, port) in services {
-            let is_healthy = self.service_health.get(&port).copied().unwrap_or(false);
+            let is_healthy = service_health.get(&port).copied().unwrap_or(false);
             let indicator = if is_healthy { "●" } else { "○" };
             let color = if is_healthy { Color::Green } else { Color::Red };
 
@@ -1078,23 +1118,27 @@ impl NetworkStatsComponent {
     fn draw_warning(&self, frame: &mut Frame, area: Rect) {
         let mut messages = Vec::new();
 
+        let (total_errors, total_dropped, conn_counts) = self.data()
+            .map(|d| (d.total_errors, d.total_dropped, d.conn_counts.clone()))
+            .unwrap_or_default();
+
         // Interface warnings
-        if self.total_errors > 0 {
-            messages.push(format!("{} interface errors", self.total_errors));
+        if total_errors > 0 {
+            messages.push(format!("{} interface errors", total_errors));
         }
-        if self.total_dropped > 0 {
-            messages.push(format!("{} dropped", self.total_dropped));
+        if total_dropped > 0 {
+            messages.push(format!("{} dropped", total_dropped));
         }
 
         // Connection warnings
-        if self.conn_counts.time_wait > 100 {
-            messages.push(format!("High TIME_WAIT ({})", self.conn_counts.time_wait));
+        if conn_counts.time_wait > 100 {
+            messages.push(format!("High TIME_WAIT ({})", conn_counts.time_wait));
         }
-        if self.conn_counts.close_wait > 0 {
-            messages.push(format!("CLOSE_WAIT ({})", self.conn_counts.close_wait));
+        if conn_counts.close_wait > 0 {
+            messages.push(format!("CLOSE_WAIT ({})", conn_counts.close_wait));
         }
-        if self.conn_counts.syn_sent > 0 {
-            messages.push(format!("SYN_SENT stuck ({})", self.conn_counts.syn_sent));
+        if conn_counts.syn_sent > 0 {
+            messages.push(format!("SYN_SENT stuck ({})", conn_counts.syn_sent));
         }
 
         if !messages.is_empty() {
@@ -1125,8 +1169,16 @@ impl NetworkStatsComponent {
             .style(Style::default().add_modifier(Modifier::DIM))
             .bottom_margin(1);
 
-        let rows: Vec<Row> = self.devices.iter().enumerate().map(|(idx, dev)| {
-            let rate = self.get_rate(&dev.name);
+        // Get data for building rows
+        let Some(data) = self.data() else {
+            let table = Table::new(Vec::<Row>::new(), [Constraint::Fill(1)])
+                .header(header);
+            frame.render_stateful_widget(table, area, &mut self.table_state);
+            return;
+        };
+
+        let rows: Vec<Row> = data.devices.iter().enumerate().map(|(idx, dev)| {
+            let rate = data.rates.get(&dev.name);
             let rx_rate = rate.map(|r| NetDevStats::format_rate(r.rx_bytes_per_sec))
                 .unwrap_or_else(|| "0 B/s".to_string());
             let tx_rate = rate.map(|r| NetDevStats::format_rate(r.tx_bytes_per_sec))
@@ -1201,11 +1253,15 @@ impl NetworkStatsComponent {
 
     /// Draw the detail section for selected device
     fn draw_detail_section(&self, frame: &mut Frame, area: Rect) {
-        let Some(dev) = self.selected_device() else {
+        let Some(data) = self.data() else {
             return;
         };
 
-        let rate = self.get_rate(&dev.name);
+        let Some(dev) = data.devices.get(self.selected) else {
+            return;
+        };
+
+        let rate = data.rates.get(&dev.name);
         let rx_rate = rate.map(|r| NetDevStats::format_rate(r.rx_bytes_per_sec))
             .unwrap_or_else(|| "0 B/s".to_string());
         let tx_rate = rate.map(|r| NetDevStats::format_rate(r.tx_bytes_per_sec))
@@ -1221,7 +1277,7 @@ impl NetworkStatsComponent {
             Style::default().fg(Color::DarkGray)
         };
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("RX: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::raw(format!("{} total", rx_total)),
@@ -1249,9 +1305,8 @@ impl NetworkStatsComponent {
         ];
 
         // Add connection summary line if we have connection data
-        let mut lines = lines;
-        if !self.connections.is_empty() {
-            let cc = &self.conn_counts;
+        if !data.connections.is_empty() {
+            let cc = &data.conn_counts;
             lines.push(Line::from(vec![
                 Span::styled("Connections: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{} ", cc.established), Style::default().fg(Color::Green)),
@@ -1275,11 +1330,14 @@ impl NetworkStatsComponent {
             ]));
         }
 
+        // Clone name before moving data
+        let dev_name = dev.name.clone();
+
         let block = Block::default()
             .borders(Borders::TOP)
             .border_style(border_style)
             .title(Span::styled(
-                format!(" {} ", dev.name),
+                format!(" {} ", dev_name),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
 
@@ -1324,7 +1382,7 @@ impl NetworkStatsComponent {
 
     /// Draw the connection view header
     fn draw_conn_header(&self, frame: &mut Frame, area: Rect) {
-        let conn_count = self.filtered_connections().len();
+        let conn_count = self.get_filtered_connections().len();
         let filter_label = if self.listening_only { " [LISTEN ONLY]" } else { "" };
 
         // Show interface name or "all" if showing all connections
@@ -1363,7 +1421,9 @@ impl NetworkStatsComponent {
 
     /// Draw the connection summary bar
     fn draw_conn_summary_bar(&self, frame: &mut Frame, area: Rect) {
-        let cc = &self.conn_counts;
+        let cc = self.data()
+            .map(|d| d.conn_counts.clone())
+            .unwrap_or_default();
 
         let spans = vec![
             Span::styled(format!("{} ", cc.established), Style::default().fg(Color::Green)),
@@ -1405,8 +1465,16 @@ impl NetworkStatsComponent {
             .style(Style::default().add_modifier(Modifier::DIM))
             .bottom_margin(1);
 
-        let conns = self.filtered_connections();
+        let conns = self.get_filtered_connections();
         let in_visual = self.conn_in_visual_mode();
+
+        // Extract data needed for the closure
+        let time_wait_count = self.data()
+            .map(|d| d.conn_counts.time_wait)
+            .unwrap_or(0);
+        let services = self.data()
+            .map(|d| d.services.clone())
+            .unwrap_or_default();
 
         let rows: Vec<Row> = conns.iter().enumerate().map(|(idx, conn)| {
             // Format local address with IP
@@ -1429,7 +1497,7 @@ impl NetworkStatsComponent {
             let (state_str, state_color) = match conn.state {
                 ConnectionState::Established => ("ESTABLISHED", Color::Green),
                 ConnectionState::Listen => ("LISTEN", Color::Cyan),
-                ConnectionState::TimeWait => ("TIME_WAIT", if self.conn_counts.time_wait > 100 { Color::Yellow } else { Color::White }),
+                ConnectionState::TimeWait => ("TIME_WAIT", if time_wait_count > 100 { Color::Yellow } else { Color::White }),
                 ConnectionState::CloseWait => ("CLOSE_WAIT", Color::Red),
                 ConnectionState::SynSent => ("SYN_SENT", Color::Yellow),
                 ConnectionState::SynRecv => ("SYN_RECV", Color::Yellow),
@@ -1445,7 +1513,7 @@ impl NetworkStatsComponent {
             // For listening ports, show service name if known
             let (owner_text, owner_color) = if let Some(service_name) = port_to_service(conn.local_port) {
                 // Check service health
-                let health_status = self.services.get(service_name)
+                let health_status = services.get(service_name)
                     .and_then(|s| s.health.as_ref())
                     .map(|h| if h.healthy { "+" } else { "!" })
                     .unwrap_or("?");
@@ -1559,10 +1627,13 @@ impl NetworkStatsComponent {
 
     /// Draw the selected connection detail section
     fn draw_conn_detail(&self, frame: &mut Frame, area: Rect) {
-        let conns = self.filtered_connections();
+        let conns = self.get_filtered_connections();
         let Some(conn) = conns.get(self.conn_selected) else {
             return;
         };
+        let services = self.data()
+            .map(|d| d.services.clone())
+            .unwrap_or_default();
 
         // Format local address
         let local_addr = if !conn.local_ip.is_empty() {
@@ -1641,7 +1712,7 @@ impl NetworkStatsComponent {
 
         // Show service info and available actions
         if let Some(service_name) = port_to_service(conn.local_port) {
-            let service_info = self.services.get(service_name);
+            let service_info = services.get(service_name);
             let (health_text, health_color) = service_info
                 .and_then(|s| s.health.as_ref())
                 .map(|h| {
@@ -1738,12 +1809,16 @@ impl NetworkStatsComponent {
         frame.render_widget(Paragraph::new(tabs), chunks[0]);
 
         // Check if KubeSpan is enabled
-        match self.kubespan_enabled {
+        let kubespan_enabled = self.data().and_then(|d| d.kubespan_enabled);
+        let kubespan_peers_empty = self.data()
+            .map(|d| d.kubespan_peers.is_empty())
+            .unwrap_or(true);
+        match kubespan_enabled {
             Some(false) => {
                 // KubeSpan not enabled
                 self.draw_kubespan_disabled(frame, chunks[1]);
             }
-            Some(true) if self.kubespan_peers.is_empty() => {
+            Some(true) if kubespan_peers_empty => {
                 // Enabled but no peers
                 self.draw_kubespan_no_peers(frame, chunks[1]);
             }
@@ -1881,9 +1956,14 @@ impl NetworkStatsComponent {
         ])
         .split(area);
 
+        // Get peer data
+        let kubespan_peers = self.data()
+            .map(|d| d.kubespan_peers.clone())
+            .unwrap_or_default();
+
         // Count connected peers
-        let connected = self.kubespan_peers.iter().filter(|p| p.state == "up").count();
-        let total = self.kubespan_peers.len();
+        let connected = kubespan_peers.iter().filter(|p| p.state == "up").count();
+        let total = kubespan_peers.len();
 
         // Header with summary
         let header = Line::from(vec![
@@ -1912,8 +1992,7 @@ impl NetworkStatsComponent {
             Cell::from("TX").style(Style::default().fg(Color::DarkGray)),
         ]);
 
-        let rows: Vec<Row> = self
-            .kubespan_peers
+        let rows: Vec<Row> = kubespan_peers
             .iter()
             .enumerate()
             .map(|(i, peer)| {
@@ -1961,7 +2040,7 @@ impl NetworkStatsComponent {
         frame.render_stateful_widget(table, content_chunks[1], &mut self.kubespan_table_state);
 
         // Detail section for selected peer
-        if let Some(peer) = self.kubespan_peers.get(self.kubespan_selected) {
+        if let Some(peer) = kubespan_peers.get(self.kubespan_selected) {
             let detail_lines = vec![
                 Line::from(vec![
                     Span::styled(" Selected: ", Style::default().fg(Color::DarkGray)),
@@ -2003,7 +2082,10 @@ impl NetworkStatsComponent {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Back)),
             KeyCode::Enter => {
-                if !self.connections.is_empty() {
+                let has_connections = self.data()
+                    .map(|d| !d.connections.is_empty())
+                    .unwrap_or(false);
+                if has_connections {
                     self.enter_connections_view();
                 }
                 Ok(None)
@@ -2067,20 +2149,23 @@ impl NetworkStatsComponent {
 
     /// Handle key events in KubeSpan view
     fn handle_kubespan_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        let peer_count = self.data()
+            .map(|d| d.kubespan_peers.len())
+            .unwrap_or(0);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Back)),
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.kubespan_peers.is_empty() {
-                    self.kubespan_selected = (self.kubespan_selected + 1) % self.kubespan_peers.len();
+                if peer_count > 0 {
+                    self.kubespan_selected = (self.kubespan_selected + 1) % peer_count;
                     self.kubespan_table_state.select(Some(self.kubespan_selected));
                 }
                 Ok(None)
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if !self.kubespan_peers.is_empty() {
+                if peer_count > 0 {
                     self.kubespan_selected = if self.kubespan_selected == 0 {
-                        self.kubespan_peers.len() - 1
+                        peer_count - 1
                     } else {
                         self.kubespan_selected - 1
                     };
@@ -2089,15 +2174,15 @@ impl NetworkStatsComponent {
                 Ok(None)
             }
             KeyCode::Char('g') => {
-                if !self.kubespan_peers.is_empty() {
+                if peer_count > 0 {
                     self.kubespan_selected = 0;
                     self.kubespan_table_state.select(Some(0));
                 }
                 Ok(None)
             }
             KeyCode::Char('G') => {
-                if !self.kubespan_peers.is_empty() {
-                    self.kubespan_selected = self.kubespan_peers.len() - 1;
+                if peer_count > 0 {
+                    self.kubespan_selected = peer_count - 1;
                     self.kubespan_table_state.select(Some(self.kubespan_selected));
                 }
                 Ok(None)
@@ -2296,7 +2381,7 @@ impl NetworkStatsComponent {
 
     /// Open logs for the currently selected connection's service
     fn open_service_logs(&self) -> Result<Option<Action>> {
-        let conns = self.filtered_connections();
+        let conns = self.get_filtered_connections();
         let Some(conn) = conns.get(self.conn_selected) else {
             return Ok(None);
         };
@@ -2318,7 +2403,7 @@ impl NetworkStatsComponent {
 
     /// Initiate service restart - sets pending_action for confirmation
     fn initiate_service_restart(&mut self) {
-        let conns = self.filtered_connections();
+        let conns = self.get_filtered_connections();
         let Some(conn) = conns.get(self.conn_selected) else {
             return;
         };
@@ -2329,7 +2414,10 @@ impl NetworkStatsComponent {
         };
 
         // Check if service exists
-        if !self.services.contains_key(service_name) {
+        let service_exists = self.data()
+            .map(|d| d.services.contains_key(service_name))
+            .unwrap_or(false);
+        if !service_exists {
             self.status_message = Some((
                 format!("Service '{}' not found", service_name),
                 Instant::now(),
@@ -2366,8 +2454,11 @@ impl NetworkStatsComponent {
     /// Draw the interfaces view (main view)
     fn draw_interfaces_view(&mut self, frame: &mut Frame, area: Rect) {
         // Build constraints dynamically based on what we need to show
-        let has_warning = self.total_errors > 0 || self.total_dropped > 0 || self.conn_counts.has_warnings();
-        let has_connections = !self.connections.is_empty();
+        let (total_errors, total_dropped, conn_counts_has_warnings, connections_empty) = self.data()
+            .map(|d| (d.total_errors, d.total_dropped, d.conn_counts.has_warnings(), d.connections.is_empty()))
+            .unwrap_or((0, 0, false, true));
+        let has_warning = total_errors > 0 || total_dropped > 0 || conn_counts_has_warnings;
+        let has_connections = !connections_empty;
         let is_capturing = self.is_capturing();
 
         let mut constraints = vec![
@@ -2479,8 +2570,8 @@ impl Component for NetworkStatsComponent {
             }
 
             // Check for auto-refresh
-            if self.auto_refresh && !self.loading {
-                if let Some(last) = self.last_refresh {
+            if self.auto_refresh && !self.state.is_loading() {
+                if let Some(last) = self.state.last_refresh() {
                     let interval = std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
                     if last.elapsed() >= interval {
                         return Ok(Some(Action::Refresh));
@@ -2492,14 +2583,14 @@ impl Component for NetworkStatsComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        if self.loading {
+        if self.state.is_loading() && self.data().is_none() {
             let loading = Paragraph::new("Loading network stats...")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(loading, area);
             return Ok(());
         }
 
-        if let Some(ref err) = self.error {
+        if let Some(err) = self.state.error() {
             let error = Paragraph::new(format!("Error: {}", err))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(error, area);
@@ -3124,9 +3215,9 @@ impl NetworkStatsComponent {
         match &self.capture.state {
             CaptureState::Idle => {
                 // Get selected interface name
-                if let Some(dev) = self.selected_device() {
+                if let Some(dev_name) = self.selected_device_name() {
                     self.capture.state = CaptureState::Capturing(
-                        dev.name.clone(),
+                        dev_name,
                         Instant::now(),
                     );
                     self.capture.data.clear();

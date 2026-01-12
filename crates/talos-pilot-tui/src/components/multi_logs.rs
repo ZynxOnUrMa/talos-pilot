@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashSet;
+use talos_pilot_core::AsyncState;
 
 /// Maximum entries to keep in memory (ring buffer)
 /// At ~500 bytes per entry average, 5000 entries ≈ 2.5MB
@@ -148,6 +149,15 @@ struct LevelState {
     entry_count: usize,
 }
 
+/// Data for multi-logs component managed by AsyncState
+#[derive(Debug, Clone, Default)]
+pub struct MultiLogsData {
+    /// All log entries (sorted by timestamp)
+    pub entries: Vec<MultiLogEntry>,
+    /// Filtered entries (indices into entries vec, only active services/levels)
+    pub visible_indices: Vec<usize>,
+}
+
 /// Multi-service logs component
 pub struct MultiLogsComponent {
     /// Node IP being viewed
@@ -169,10 +179,8 @@ pub struct MultiLogsComponent {
     /// Levels list state
     levels_state: ListState,
 
-    /// All log entries (sorted by timestamp)
-    entries: Vec<MultiLogEntry>,
-    /// Filtered entries (indices into entries vec, only active services/levels)
-    visible_indices: Vec<usize>,
+    /// Async state for log data (entries and visible indices)
+    state: AsyncState<MultiLogsData>,
 
     /// Which floating pane is open
     floating_pane: FloatingPane,
@@ -182,11 +190,6 @@ pub struct MultiLogsComponent {
     viewport_height: u16,
     /// Following mode (auto-scroll to bottom)
     following: bool,
-
-    /// Whether logs are loading
-    loading: bool,
-    /// Error message if any
-    error: Option<String>,
 
     /// Search mode
     search_mode: SearchMode,
@@ -266,14 +269,16 @@ impl MultiLogsComponent {
             levels,
             selected_level: 0,
             levels_state,
-            entries: Vec::new(),
-            visible_indices: Vec::new(),
+            state: {
+                let mut state = AsyncState::new();
+                state.start_loading();
+                state.set_data(MultiLogsData::default());
+                state
+            },
             floating_pane: FloatingPane::None, // Start with pane closed
             scroll: 0,
             viewport_height: 20, // Will be updated on first draw
             following: true,
-            loading: true,
-            error: None,
             search_mode: SearchMode::Off,
             search_query: String::new(),
             match_set: HashSet::new(),
@@ -296,6 +301,16 @@ impl MultiLogsComponent {
     pub fn set_client(&mut self, client: talos_rs::TalosClient, tail_lines: i32) {
         self.client = Some(client);
         self.tail_lines = tail_lines;
+    }
+
+    /// Get reference to data (if loaded)
+    fn data(&self) -> Option<&MultiLogsData> {
+        self.state.data()
+    }
+
+    /// Get mutable reference to data (if loaded)
+    fn data_mut(&mut self) -> Option<&mut MultiLogsData> {
+        self.state.data_mut()
     }
 
     /// Start streaming logs from all active services
@@ -404,19 +419,22 @@ impl MultiLogsComponent {
             })
             .collect();
 
+        // Get data and add new entries
+        let Some(data) = self.data_mut() else { return };
+
         // Add new entries
-        self.entries.extend(new_entries);
+        data.entries.extend(new_entries);
 
         // Re-sort (could optimize with insertion sort for streaming)
-        self.entries.sort_by_key(|e| e.timestamp_sort);
+        data.entries.sort_by_key(|e| e.timestamp_sort);
 
         // Enforce max entries (ring buffer) - this is the primary memory bound
-        if self.entries.len() > MAX_ENTRIES {
-            let excess = self.entries.len() - MAX_ENTRIES;
-            self.entries.drain(0..excess);
+        if data.entries.len() > MAX_ENTRIES {
+            let excess = data.entries.len() - MAX_ENTRIES;
+            data.entries.drain(0..excess);
             // Shrink capacity periodically to release memory
-            if self.entries.capacity() > MAX_ENTRIES * 2 {
-                self.entries.shrink_to(MAX_ENTRIES + 1000);
+            if data.entries.capacity() > MAX_ENTRIES * 2 {
+                data.entries.shrink_to(MAX_ENTRIES + 1000);
             }
         }
 
@@ -436,23 +454,43 @@ impl MultiLogsComponent {
     /// Service counts show total entries for each service
     /// Level counts show entries filtered by active services (so you see relevant breakdown)
     fn update_counts(&mut self) {
-        // Service counts: total entries for each service (not filtered)
-        for service in &mut self.services {
-            service.entry_count = self.entries.iter().filter(|e| e.service_id == service.id).count();
-        }
+        // Compute counts from entries, then release borrow before mutating services/levels
+        let (service_counts, level_counts): (Vec<_>, Vec<_>) = {
+            let Some(data) = self.data() else { return };
+            let entries = &data.entries;
 
-        // Level counts: filtered by active services
-        let active_services: HashSet<&str> = self.services
-            .iter()
-            .filter(|s| s.active)
-            .map(|s| s.id.as_str())
-            .collect();
-
-        for level_state in &mut self.levels {
-            level_state.entry_count = self.entries
+            // Service counts: total entries for each service (not filtered)
+            let service_counts: Vec<_> = self.services
                 .iter()
-                .filter(|e| active_services.contains(e.service_id.as_str()) && e.level == level_state.level)
-                .count();
+                .map(|s| entries.iter().filter(|e| e.service_id == s.id).count())
+                .collect();
+
+            // Level counts: filtered by active services
+            let active_services: HashSet<&str> = self.services
+                .iter()
+                .filter(|s| s.active)
+                .map(|s| s.id.as_str())
+                .collect();
+
+            let level_counts: Vec<_> = self.levels
+                .iter()
+                .map(|l| {
+                    entries
+                        .iter()
+                        .filter(|e| active_services.contains(e.service_id.as_str()) && e.level == l.level)
+                        .count()
+                })
+                .collect();
+
+            (service_counts, level_counts)
+        };
+
+        // Now apply the counts
+        for (service, count) in self.services.iter_mut().zip(service_counts) {
+            service.entry_count = count;
+        }
+        for (level, count) in self.levels.iter_mut().zip(level_counts) {
+            level.entry_count = count;
         }
     }
 
@@ -467,9 +505,8 @@ impl MultiLogsComponent {
 
     /// Set log content from multiple services
     pub fn set_logs(&mut self, logs: Vec<(String, String)>) {
-        self.entries.clear();
-
-        // Parse all logs
+        // Parse entries (need service colors first)
+        let mut new_entries = Vec::new();
         for (service_id, content) in logs {
             let color = self.get_service_color(&service_id);
 
@@ -479,16 +516,21 @@ impl MultiLogsComponent {
                 }
 
                 let entry = Self::parse_line(line, &service_id, color);
-                self.entries.push(entry);
+                new_entries.push(entry);
             }
         }
 
         // Sort by timestamp
-        self.entries.sort_by_key(|e| e.timestamp_sort);
+        new_entries.sort_by_key(|e| e.timestamp_sort);
 
         // Enforce max entries (ring buffer behavior)
-        if self.entries.len() > MAX_ENTRIES {
-            self.entries.drain(0..self.entries.len() - MAX_ENTRIES);
+        if new_entries.len() > MAX_ENTRIES {
+            new_entries.drain(0..new_entries.len() - MAX_ENTRIES);
+        }
+
+        // Update data
+        if let Some(data) = self.data_mut() {
+            data.entries = new_entries;
         }
 
         // Update counts
@@ -497,7 +539,7 @@ impl MultiLogsComponent {
         // Build visible indices
         self.rebuild_visible_indices();
 
-        self.loading = false;
+        self.state.mark_loaded();
 
         // Scroll to bottom if following
         if self.following {
@@ -855,16 +897,16 @@ impl MultiLogsComponent {
 
     /// Set error message
     pub fn set_error(&mut self, error: String) {
-        self.error = Some(error);
-        self.loading = false;
+        self.state.set_error(error);
     }
 
     /// Rebuild visible indices based on active services
     fn rebuild_visible_indices(&mut self) {
-        let active_services: HashSet<&str> = self.services
+        // Clone to owned strings to avoid borrow issues
+        let active_services: HashSet<String> = self.services
             .iter()
             .filter(|s| s.active)
-            .map(|s| s.id.as_str())
+            .map(|s| s.id.clone())
             .collect();
 
         let active_levels: HashSet<LogLevel> = self.levels
@@ -873,17 +915,22 @@ impl MultiLogsComponent {
             .map(|l| l.level)
             .collect();
 
-        self.visible_indices = self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                active_services.contains(e.service_id.as_str()) && active_levels.contains(&e.level)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let total = {
+            let Some(data) = self.data_mut() else { return };
+
+            data.visible_indices = data.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    active_services.contains(&e.service_id) && active_levels.contains(&e.level)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            data.visible_indices.len()
+        };
 
         // Clamp scroll to valid range (max is where last entry is at viewport bottom)
-        let total = self.visible_indices.len();
         let viewport = self.viewport_height as usize;
         let max_scroll = total.saturating_sub(viewport) as u16;
         if self.scroll > max_scroll {
@@ -976,7 +1023,7 @@ impl MultiLogsComponent {
 
     /// Scroll down
     fn scroll_down(&mut self, amount: u16) {
-        let total = self.visible_indices.len();
+        let total = self.data().map(|d| d.visible_indices.len()).unwrap_or(0);
         let viewport = self.viewport_height as usize;
         // Max scroll is where last entry is at bottom of viewport
         let max = total.saturating_sub(viewport) as u16;
@@ -999,7 +1046,7 @@ impl MultiLogsComponent {
     /// Sets scroll so the last entries fill the viewport from the bottom
     /// Also moves cursor to the last entry
     fn scroll_to_bottom(&mut self) {
-        let total = self.visible_indices.len();
+        let total = self.data().map(|d| d.visible_indices.len()).unwrap_or(0);
         let viewport = self.viewport_height as usize;
         // Position scroll so last entry is at bottom of viewport
         self.scroll = total.saturating_sub(viewport) as u16;
@@ -1010,7 +1057,8 @@ impl MultiLogsComponent {
 
     /// Get the entry at the cursor position
     fn current_entry(&self) -> Option<&MultiLogEntry> {
-        self.visible_indices.get(self.cursor).and_then(|&i| self.entries.get(i))
+        let data = self.data()?;
+        data.visible_indices.get(self.cursor).and_then(|&i| data.entries.get(i))
     }
 
     /// Check if visual selection mode is active
@@ -1057,12 +1105,16 @@ impl MultiLogsComponent {
 
     /// Yank (copy) selected lines or current line to system clipboard
     fn yank_selection(&self) -> (bool, usize) {
+        let Some(data) = self.data() else {
+            return (false, 0);
+        };
+
         let lines: Vec<String> = if let Some((start, end)) = self.selection_range() {
             // Yank all selected lines
             (start..=end)
                 .filter_map(|vi| {
-                    self.visible_indices.get(vi)
-                        .and_then(|&i| self.entries.get(i))
+                    data.visible_indices.get(vi)
+                        .and_then(|&i| data.entries.get(i))
                         .map(Self::format_entry)
                 })
                 .collect()
@@ -1096,12 +1148,23 @@ impl MultiLogsComponent {
             return;
         }
 
-        let query_lower = self.search_query.to_lowercase();
-        for (vi, &entry_idx) in self.visible_indices.iter().enumerate() {
-            if self.entries[entry_idx].search_text.contains(&query_lower) {
-                self.match_set.insert(vi);
-                self.match_order.push(vi);
-            }
+        // Collect matches first, then release borrow before mutating
+        let matches: Vec<usize> = {
+            let Some(data) = self.data() else { return };
+            let query_lower = self.search_query.to_lowercase();
+
+            data.visible_indices
+                .iter()
+                .enumerate()
+                .filter(|&(_, entry_idx)| data.entries[*entry_idx].search_text.contains(&query_lower))
+                .map(|(vi, _)| vi)
+                .collect()
+        };
+
+        // Now apply matches
+        for vi in matches {
+            self.match_set.insert(vi);
+            self.match_order.push(vi);
         }
 
         if !self.match_order.is_empty() {
@@ -1315,13 +1378,13 @@ impl MultiLogsComponent {
 
     /// Draw the logs area
     fn draw_logs(&self, frame: &mut Frame, area: Rect) {
-        if self.loading {
+        if self.state.is_loading() {
             let loading = Paragraph::new(Line::from(Span::raw(" Loading logs...").dim()));
             frame.render_widget(loading, area);
             return;
         }
 
-        if let Some(error) = &self.error {
+        if let Some(error) = self.state.error() {
             let error_msg = Paragraph::new(vec![
                 Line::from(vec![Span::raw(" Error: ").fg(Color::Red).bold()]),
                 Line::from(vec![Span::raw(" "), Span::raw(error).fg(Color::White)]),
@@ -1330,7 +1393,9 @@ impl MultiLogsComponent {
             return;
         }
 
-        if self.visible_indices.is_empty() {
+        let Some(data) = self.data() else { return };
+
+        if data.visible_indices.is_empty() {
             let msg = if self.active_count() == 0 || self.active_level_count() == 0 {
                 " No services/levels selected. Press 's' or 'l' to open filters."
             } else {
@@ -1345,16 +1410,16 @@ impl MultiLogsComponent {
         let content_width = area.width.saturating_sub(1) as usize; // -1 for scrollbar
 
         // Safety clamp scroll to valid range (max is where last entry is at viewport bottom)
-        let total = self.visible_indices.len();
+        let total = data.visible_indices.len();
         let max_start = total.saturating_sub(visible_height);
         let start = (self.scroll as usize).min(max_start);
         let end = (start + visible_height).min(total);
 
         let mut lines: Vec<Line> = Vec::new();
 
-        for (vi, &entry_idx) in self.visible_indices[start..end].iter().enumerate() {
+        for (vi, &entry_idx) in data.visible_indices[start..end].iter().enumerate() {
             let visible_idx = start + vi;
-            let entry = &self.entries[entry_idx];
+            let entry = &data.entries[entry_idx];
             let is_current_match = self.is_current_match(visible_idx);
             let is_match = self.entry_matches(visible_idx);
             let is_selected = self.is_selected(visible_idx);
@@ -1475,13 +1540,13 @@ impl MultiLogsComponent {
         frame.render_widget(logs, area);
 
         // Scrollbar
-        if self.visible_indices.len() > visible_height {
+        if data.visible_indices.len() > visible_height {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
                 .end_symbol(Some("▼"))
                 .track_symbol(Some("│"))
                 .thumb_symbol("█");
-            let mut scrollbar_state = ScrollbarState::new(self.visible_indices.len())
+            let mut scrollbar_state = ScrollbarState::new(data.visible_indices.len())
                 .position(self.scroll as usize)
                 .viewport_content_length(visible_height);
             frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
@@ -1598,7 +1663,7 @@ impl Component for MultiLogsComponent {
                     }
                     FloatingPane::None => {
                         // Always move cursor down
-                        let max_idx = self.visible_indices.len().saturating_sub(1);
+                        let max_idx = self.data().map(|d| d.visible_indices.len()).unwrap_or(0).saturating_sub(1);
                         self.cursor = (self.cursor + 1).min(max_idx);
                         // Scroll viewport if cursor goes below visible area
                         let viewport = self.viewport_height as usize;
@@ -1622,7 +1687,7 @@ impl Component for MultiLogsComponent {
             }
             KeyCode::PageDown => {
                 // Always move cursor
-                let max_idx = self.visible_indices.len().saturating_sub(1);
+                let max_idx = self.data().map(|d| d.visible_indices.len()).unwrap_or(0).saturating_sub(1);
                 self.cursor = (self.cursor + 20).min(max_idx);
                 let viewport = self.viewport_height as usize;
                 let visible_end = self.scroll as usize + viewport;
@@ -1648,7 +1713,7 @@ impl Component for MultiLogsComponent {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let half = (self.viewport_height / 2).max(1) as usize;
                 // Always move cursor down by half page
-                let max_idx = self.visible_indices.len().saturating_sub(1);
+                let max_idx = self.data().map(|d| d.visible_indices.len()).unwrap_or(0).saturating_sub(1);
                 self.cursor = (self.cursor + half).min(max_idx);
                 // Scroll to keep cursor visible
                 let viewport = self.viewport_height as usize;
@@ -1668,10 +1733,11 @@ impl Component for MultiLogsComponent {
             }
             KeyCode::Char('G') => {
                 // Always move cursor to bottom
-                let max_idx = self.visible_indices.len().saturating_sub(1);
+                let len = self.data().map(|d| d.visible_indices.len()).unwrap_or(0);
+                let max_idx = len.saturating_sub(1);
                 self.cursor = max_idx;
                 let viewport = self.viewport_height as usize;
-                self.scroll = self.visible_indices.len().saturating_sub(viewport) as u16;
+                self.scroll = len.saturating_sub(viewport) as u16;
                 self.following = true;
                 Ok(None)
             }
