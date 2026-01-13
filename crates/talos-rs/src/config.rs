@@ -49,8 +49,14 @@ impl TalosConfig {
         Ok(config)
     }
 
-    /// Get the default config path (~/.talos/config)
+    /// Get the default config path (from $TALOSCONFIG env var or ~/.talos/config)
     pub fn default_path() -> Result<PathBuf, TalosError> {
+        // Check if TALOSCONFIG environment variable is set
+        if let Ok(talosconfig) = std::env::var("TALOSCONFIG") {
+            return Ok(PathBuf::from(talosconfig));
+        }
+
+        // Fallback to default location
         let home = dirs_next::home_dir().ok_or(TalosError::NoHomeDirectory)?;
         Ok(home.join(".talos").join("config"))
     }
@@ -337,5 +343,53 @@ contexts:
             key: "Yw==".to_string(),
         };
         assert_eq!(ctx.endpoint_url(), None);
+    }
+
+    #[test]
+    fn test_default_path_with_env_var() {
+        // Set TALOSCONFIG environment variable
+        unsafe {
+            std::env::set_var("TALOSCONFIG", "/custom/path/to/talosconfig");
+        }
+
+        let path = TalosConfig::default_path().unwrap();
+        assert_eq!(path, PathBuf::from("/custom/path/to/talosconfig"));
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("TALOSCONFIG");
+        }
+    }
+
+    #[test]
+    fn test_default_path_without_env_var() {
+        // Ensure TALOSCONFIG is not set
+        unsafe {
+            std::env::remove_var("TALOSCONFIG");
+        }
+
+        let path = TalosConfig::default_path().unwrap();
+        let home = dirs_next::home_dir().unwrap();
+        let expected = home.join(".talos").join("config");
+
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn test_default_path_env_var_takes_precedence() {
+        // Set TALOSCONFIG to a custom path
+        let custom_path = "/tmp/my-talos-config.yaml";
+        unsafe {
+            std::env::set_var("TALOSCONFIG", custom_path);
+        }
+
+        let path = TalosConfig::default_path().unwrap();
+        assert_eq!(path, PathBuf::from(custom_path));
+        assert!(!path.to_string_lossy().contains(".talos"));
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("TALOSCONFIG");
+        }
     }
 }
