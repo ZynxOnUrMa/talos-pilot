@@ -65,6 +65,8 @@ pub struct App {
     action_rx: mpsc::UnboundedReceiver<AsyncResult>,
     #[allow(dead_code)] // Will be used for background log streaming
     action_tx: mpsc::UnboundedSender<AsyncResult>,
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
 }
 
 /// Results from async operations
@@ -79,17 +81,17 @@ enum AsyncResult {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(None, 500)
+        Self::new(None, None, 500)
     }
 }
 
 impl App {
-    pub fn new(context: Option<String>, tail_lines: i32) -> Self {
+    pub fn new(config_path: Option<String>, context: Option<String>, tail_lines: i32) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Self {
             should_quit: false,
             view: View::Cluster,
-            cluster: ClusterComponent::new(context),
+            cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
             etcd: None,
             processes: None,
@@ -104,6 +106,7 @@ impl App {
             tick_rate: Duration::from_millis(100),
             action_rx,
             action_tx,
+            config_path,
         }
     }
 
@@ -579,7 +582,12 @@ impl App {
                 );
 
                 // Create diagnostics component
-                let mut diagnostics = DiagnosticsComponent::new(hostname, address.clone(), role);
+                let mut diagnostics = DiagnosticsComponent::new(
+                    hostname,
+                    address.clone(),
+                    role,
+                    self.config_path.clone(),
+                );
 
                 // Set the control plane endpoint for worker nodes to fetch kubeconfig
                 diagnostics.set_controlplane_endpoint(cp_endpoint);
@@ -685,7 +693,7 @@ impl App {
                 tracing::info!("Viewing security/certificates");
 
                 // Create security component
-                let mut security = SecurityComponent::new(String::new());
+                let mut security = SecurityComponent::new(String::new(), self.config_path.clone());
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
@@ -705,7 +713,8 @@ impl App {
                 tracing::info!("Viewing lifecycle/versions");
 
                 // Create lifecycle component
-                let mut lifecycle = LifecycleComponent::new(String::new());
+                let mut lifecycle =
+                    LifecycleComponent::new(String::new(), self.config_path.clone());
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {

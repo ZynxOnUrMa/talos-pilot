@@ -162,12 +162,21 @@ pub fn get_discovery_members(node: &str) -> Result<Vec<DiscoveryMember>, TalosEr
 /// This version uses the context name to get the correct certificates and endpoint,
 /// and uses tokio async process to avoid blocking the runtime.
 /// It extracts a node IP from the context's endpoints to target the query.
+///
+/// If `config_path` is provided, loads config from that path instead of the default.
 pub async fn get_discovery_members_for_context(
     context: &str,
+    config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
     // Load config to get an endpoint IP to use as the node target
     // talosctl requires -n flag if nodes: is not set in the config
-    let config = crate::TalosConfig::load_default()?;
+    let config = match config_path {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            crate::TalosConfig::load_from(&path_buf)?
+        }
+        None => crate::TalosConfig::load_default()?,
+    };
     let ctx = config
         .contexts
         .get(context)
@@ -188,10 +197,14 @@ pub async fn get_discovery_members_for_context(
     }
 
     let output = exec_talosctl_async(&[
-        "--context", context,
-        "-n", &node_ip,
-        "get", "members",
-        "-o", "yaml",
+        "--context",
+        context,
+        "-n",
+        &node_ip,
+        "get",
+        "members",
+        "-o",
+        "yaml",
     ])
     .await?;
     parse_discovery_members_yaml(&output)

@@ -60,9 +60,12 @@ async fn main() -> Result<()> {
     if let Some(ctx) = &cli.context {
         tracing::info!("Using context: {}", ctx);
     }
+    if let Some(cfg) = &cli.config {
+        tracing::info!("Using config: {}", cfg);
+    }
 
-    // Run the TUI with the specified context and tail limit
-    let mut app = App::new(cli.context, cli.tail);
+    // Run the TUI with the specified config, context and tail limit
+    let mut app = App::new(cli.config, cli.context, cli.tail);
     app.run().await?;
 
     tracing::info!("Goodbye!");
