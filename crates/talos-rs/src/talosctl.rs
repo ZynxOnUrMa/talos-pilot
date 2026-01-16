@@ -264,6 +264,90 @@ pub async fn get_disks_for_context(
     parse_disks_yaml(&output)
 }
 
+// ============================================================================
+// Insecure Mode Functions
+// ============================================================================
+// These functions connect to Talos nodes without TLS client certificates.
+// Used for maintenance mode nodes that haven't been bootstrapped yet.
+
+/// Get disks from a node in insecure mode (no TLS client auth)
+///
+/// Executes: talosctl get disks --insecure -n <endpoint> -o yaml
+///
+/// This is useful for pre-bootstrap scenarios where you want to see
+/// what disks are available before writing the machine configuration.
+pub async fn get_disks_insecure(endpoint: &str) -> Result<Vec<DiskInfo>, TalosError> {
+    let output =
+        exec_talosctl_async(&["get", "disks", "--insecure", "-n", endpoint, "-o", "yaml"]).await?;
+    parse_disks_yaml(&output)
+}
+
+/// Get volume status from a node in insecure mode (no TLS client auth)
+///
+/// Executes: talosctl get volumestatus --insecure -n <endpoint> -o yaml
+pub async fn get_volume_status_insecure(endpoint: &str) -> Result<Vec<VolumeStatus>, TalosError> {
+    let output =
+        exec_talosctl_async(&["get", "volumestatus", "--insecure", "-n", endpoint, "-o", "yaml"])
+            .await?;
+    parse_volume_status_yaml(&output)
+}
+
+/// Version info returned from insecure mode
+#[derive(Debug, Clone)]
+pub struct InsecureVersionInfo {
+    /// Talos version tag (e.g., "v1.12.1")
+    pub tag: String,
+    /// Whether the node is in maintenance mode
+    pub maintenance_mode: bool,
+}
+
+/// Get version info from a node in insecure mode (no TLS client auth)
+///
+/// Executes: talosctl version --insecure -n <endpoint>
+///
+/// Note: In maintenance mode, the full version API is not available,
+/// so this may return limited info or fail gracefully.
+pub async fn get_version_insecure(endpoint: &str) -> Result<InsecureVersionInfo, TalosError> {
+    let output = exec_talosctl_async(&["version", "--insecure", "-n", endpoint]).await;
+
+    match output {
+        Ok(text) => {
+            // Parse version output - look for "Tag:" line
+            let tag = text
+                .lines()
+                .find(|l| l.trim().starts_with("Tag:"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            Ok(InsecureVersionInfo {
+                tag,
+                maintenance_mode: false,
+            })
+        }
+        Err(e) => {
+            // Check if it's a "not implemented in maintenance mode" error
+            let err_str = e.to_string();
+            if err_str.contains("maintenance mode") || err_str.contains("not implemented") {
+                Ok(InsecureVersionInfo {
+                    tag: "unknown".to_string(),
+                    maintenance_mode: true,
+                })
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Check if a node is reachable in insecure mode
+///
+/// Returns true if we can connect to the maintenance API
+pub async fn check_insecure_connection(endpoint: &str) -> bool {
+    // Try to get disks - this works in maintenance mode
+    get_disks_insecure(endpoint).await.is_ok()
+}
+
 /// Get machine config info for a node
 ///
 /// Executes: talosctl get machineconfig --nodes <node> -o yaml

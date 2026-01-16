@@ -3,9 +3,10 @@
 use crate::action::Action;
 use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::{
-    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
-    MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
-    RollingOperationsComponent, SecurityComponent, StorageComponent, WorkloadHealthComponent,
+    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, InsecureComponent,
+    LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent,
+    ProcessesComponent, RollingOperationsComponent, SecurityComponent, StorageComponent,
+    WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -70,6 +71,10 @@ pub struct App {
     action_tx: mpsc::UnboundedSender<AsyncResult>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// Whether running in insecure mode (no TLS)
+    insecure: bool,
+    /// Endpoint for insecure mode
+    insecure_endpoint: Option<String>,
 }
 
 /// Results from async operations
@@ -84,12 +89,18 @@ enum AsyncResult {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(None, None, 500)
+        Self::new(None, None, 500, false, None)
     }
 }
 
 impl App {
-    pub fn new(config_path: Option<String>, context: Option<String>, tail_lines: i32) -> Self {
+    pub fn new(
+        config_path: Option<String>,
+        context: Option<String>,
+        tail_lines: i32,
+        insecure: bool,
+        insecure_endpoint: Option<String>,
+    ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Self {
             should_quit: false,
@@ -111,6 +122,8 @@ impl App {
             action_rx,
             action_tx,
             config_path,
+            insecure,
+            insecure_endpoint,
         }
     }
 
@@ -122,13 +135,66 @@ impl App {
         // Initialize terminal
         let mut terminal = tui::init()?;
 
-        // Main loop
-        let result = self.main_loop(&mut terminal).await;
+        // Main loop - choose based on mode
+        let result = if self.insecure {
+            self.insecure_loop(&mut terminal).await
+        } else {
+            self.main_loop(&mut terminal).await
+        };
 
         // Restore terminal
         tui::restore()?;
 
         result
+    }
+
+    /// Insecure mode event loop - simplified for maintenance mode nodes
+    async fn insecure_loop(&mut self, terminal: &mut Tui) -> Result<()> {
+        let endpoint = self
+            .insecure_endpoint
+            .clone()
+            .expect("Insecure mode requires endpoint");
+
+        let mut insecure = InsecureComponent::new(endpoint);
+
+        // Connect on startup
+        insecure.connect().await?;
+
+        loop {
+            // Draw
+            terminal.draw(|frame| {
+                let _ = insecure.draw(frame, frame.area());
+            })?;
+
+            // Handle events with timeout
+            if event::poll(self.tick_rate)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if let Some(action) = insecure.handle_key_event(key)? {
+                            match action {
+                                Action::Quit => {
+                                    self.should_quit = true;
+                                }
+                                Action::Refresh => {
+                                    insecure.refresh().await?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        // Terminal will automatically resize on next draw
+                    }
+                    _ => {}
+                }
+            }
+
+            if self.should_quit {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Main event loop
