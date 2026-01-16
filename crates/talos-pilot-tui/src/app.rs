@@ -296,12 +296,12 @@ impl App {
             return false;
         }
 
-        if let Ok(out) = &merge_output {
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!("Failed to merge config: {}", stderr);
-                return false;
-            }
+        if let Ok(out) = &merge_output
+            && !out.status.success()
+        {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!("Failed to merge config: {}", stderr);
+            return false;
         }
 
         // Set the endpoint on the context
