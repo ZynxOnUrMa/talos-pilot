@@ -43,6 +43,7 @@ pub enum NavMenuItem {
     Logs,
     Etcd,
     Network,
+    Storage,
     Processes,
     Diagnostics,
     Certs,
@@ -51,10 +52,11 @@ pub enum NavMenuItem {
 }
 
 impl NavMenuItem {
-    const ALL: [NavMenuItem; 8] = [
+    const ALL: [NavMenuItem; 9] = [
         NavMenuItem::Logs,
         NavMenuItem::Etcd,
         NavMenuItem::Network,
+        NavMenuItem::Storage,
         NavMenuItem::Processes,
         NavMenuItem::Diagnostics,
         NavMenuItem::Certs,
@@ -67,6 +69,7 @@ impl NavMenuItem {
             NavMenuItem::Logs => "Logs",
             NavMenuItem::Etcd => "etcd",
             NavMenuItem::Network => "Net",
+            NavMenuItem::Storage => "Stor",
             NavMenuItem::Processes => "Proc",
             NavMenuItem::Diagnostics => "Diag",
             NavMenuItem::Certs => "Certs",
@@ -80,6 +83,7 @@ impl NavMenuItem {
             NavMenuItem::Logs => "L",
             NavMenuItem::Etcd => "e",
             NavMenuItem::Network => "n",
+            NavMenuItem::Storage => "s",
             NavMenuItem::Processes => "p",
             NavMenuItem::Diagnostics => "d",
             NavMenuItem::Certs => "c",
@@ -731,6 +735,18 @@ impl ClusterComponent {
         self.clusters.get(self.active_cluster)?.client.as_ref()
     }
 
+    /// Get context name for active cluster
+    pub fn current_context_name(&self) -> Option<&str> {
+        self.clusters
+            .get(self.active_cluster)
+            .map(|c| c.name.as_str())
+    }
+
+    /// Get config path
+    pub fn config_path(&self) -> Option<&str> {
+        self.config_path.as_deref()
+    }
+
     /// Get node_ips for active cluster
     fn node_ips(&self) -> &HashMap<String, String> {
         static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
@@ -831,6 +847,18 @@ impl ClusterComponent {
                         .cloned()
                         .unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    Ok(None)
+                }
+            }
+            NavMenuItem::Storage => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self
+                        .node_ips()
+                        .get(&node_name)
+                        .cloned()
+                        .unwrap_or(node_name.clone());
+                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
                 } else {
                     Ok(None)
                 }
@@ -1059,6 +1087,18 @@ impl Component for ClusterComponent {
                         .cloned()
                         .unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    Ok(None)
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self
+                        .node_ips()
+                        .get(&node_name)
+                        .cloned()
+                        .unwrap_or(node_name.clone());
+                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
                 } else {
                     Ok(None)
                 }

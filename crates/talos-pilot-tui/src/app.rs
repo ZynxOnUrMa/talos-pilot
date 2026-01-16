@@ -5,7 +5,7 @@ use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::{
     ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
     MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
-    RollingOperationsComponent, SecurityComponent, WorkloadHealthComponent,
+    RollingOperationsComponent, SecurityComponent, StorageComponent, WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -25,6 +25,7 @@ enum View {
     Security,
     Lifecycle,
     Workloads,
+    Storage,
     NodeOperations,
     RollingOperations,
 }
@@ -53,6 +54,8 @@ pub struct App {
     lifecycle: Option<LifecycleComponent>,
     /// Workload health component (created when viewing workloads)
     workloads: Option<WorkloadHealthComponent>,
+    /// Storage component (created when viewing disks/volumes)
+    storage: Option<StorageComponent>,
     /// Node operations component (overlay for node operations)
     node_operations: Option<NodeOperationsComponent>,
     /// Rolling operations component (overlay for multi-node operations)
@@ -100,6 +103,7 @@ impl App {
             security: None,
             lifecycle: None,
             workloads: None,
+            storage: None,
             node_operations: None,
             rolling_operations: None,
             tail_lines,
@@ -180,6 +184,11 @@ impl App {
                             let _ = workloads.draw(frame, area);
                         }
                     }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage {
+                            let _ = storage.draw(frame, area);
+                        }
+                    }
                     View::NodeOperations => {
                         // Draw cluster in background, then overlay
                         let _ = self.cluster.draw(frame, area);
@@ -255,6 +264,13 @@ impl App {
                             View::Workloads => {
                                 if let Some(workloads) = &mut self.workloads {
                                     workloads.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Storage => {
+                                if let Some(storage) = &mut self.storage {
+                                    storage.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -354,6 +370,9 @@ impl App {
                     View::Workloads => {
                         self.workloads = None;
                     }
+                    View::Storage => {
+                        self.storage = None;
+                    }
                     View::NodeOperations => {
                         self.node_operations = None;
                     }
@@ -429,6 +448,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Some(next_action) = storage.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -520,6 +546,13 @@ impl App {
                             && let Err(e) = workloads.refresh().await
                         {
                             workloads.set_error(e.to_string());
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Err(e) = storage.refresh().await
+                        {
+                            storage.set_error(e.to_string());
                         }
                     }
                     View::NodeOperations => {
@@ -758,6 +791,36 @@ impl App {
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
             }
+            Action::ShowStorage(hostname, address) => {
+                // Switch to storage view for a node
+                tracing::info!(
+                    "ShowStorage: hostname='{}', address='{}'",
+                    hostname,
+                    address
+                );
+
+                // Get context and config from cluster component
+                let context = self.cluster.current_context_name().map(|s| s.to_string());
+                let config_path = self.cluster.config_path().map(|s| s.to_string());
+
+                // Create storage component with context for authentication
+                let mut storage =
+                    StorageComponent::new(hostname, address.clone(), context, config_path);
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    // Create a client configured for this specific node
+                    let node_client = client.with_node(&address);
+                    storage.set_client(node_client);
+                    if let Err(e) = storage.refresh().await {
+                        tracing::error!("Storage refresh error: {:?}", e);
+                        storage.set_error(e.to_string());
+                    }
+                }
+
+                self.storage = Some(storage);
+                self.view = View::Storage;
+            }
             Action::ShowNodeOperations(hostname, address, is_controlplane) => {
                 // Show node operations overlay
                 tracing::info!("Viewing node operations for: {} ({})", hostname, address);
@@ -874,6 +937,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Some(next_action) = storage.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

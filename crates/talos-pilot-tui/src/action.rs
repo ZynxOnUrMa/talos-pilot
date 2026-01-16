@@ -44,6 +44,8 @@ pub enum Action {
     ShowLifecycle,
     /// Show workload health view
     ShowWorkloads,
+    /// Show storage/disks view for a node: (hostname, address)
+    ShowStorage(String, String),
     /// Show node operations overlay: (hostname, address, is_controlplane)
     ShowNodeOperations(String, String, bool),
     /// Show rolling operations overlay with node list: Vec<(hostname, address, is_controlplane)>

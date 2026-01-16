@@ -107,7 +107,8 @@ pub use client::{
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;
 pub use talosctl::{
-    AddressStatus, DiscoveryMember, KubeSpanPeerStatus, MachineConfigInfo, VolumeStatus,
-    get_address_status, get_discovery_members, get_discovery_members_for_context,
-    get_kubespan_peers, get_machine_config, get_volume_status, is_kubespan_enabled,
+    AddressStatus, DiscoveryMember, DiskInfo, KubeSpanPeerStatus, MachineConfigInfo, VolumeStatus,
+    get_address_status, get_discovery_members, get_discovery_members_for_context, get_disks,
+    get_disks_for_context, get_disks_for_node, get_kubespan_peers, get_machine_config,
+    get_volume_status, get_volume_status_for_node, is_kubespan_enabled,
 };

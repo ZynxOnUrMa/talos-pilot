@@ -14,6 +14,7 @@ pub mod node_operations;
 pub mod processes;
 pub mod rolling_operations;
 pub mod security;
+pub mod storage;
 pub mod workloads;
 
 pub use cluster::ClusterComponent;
@@ -28,6 +29,7 @@ pub use node_operations::NodeOperationsComponent;
 pub use processes::ProcessesComponent;
 pub use rolling_operations::RollingOperationsComponent;
 pub use security::SecurityComponent;
+pub use storage::StorageComponent;
 pub use workloads::WorkloadHealthComponent;
 
 use crate::action::Action;
