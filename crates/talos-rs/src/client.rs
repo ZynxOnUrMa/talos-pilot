@@ -2882,7 +2882,11 @@ mod tests {
     async fn test_metadata_multiple_nodes_uses_nodes_header() {
         // Multiple nodes should use "nodes" (plural) header
         let client = create_test_client(
-            vec!["node1".to_string(), "node2".to_string(), "node3".to_string()],
+            vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string(),
+            ],
             vec!["vip.example.com:50000".to_string()],
         );
 
@@ -2908,7 +2912,11 @@ mod tests {
         // tonic's append() creates multiple values for the same key
         // This matches Talos Go client's md.Set("nodes", nodes...) behavior
         let client = create_test_client(
-            vec!["node1".to_string(), "node2".to_string(), "node3".to_string()],
+            vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string(),
+            ],
             vec!["vip.example.com:50000".to_string()],
         );
 

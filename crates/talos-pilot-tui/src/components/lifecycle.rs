@@ -5,7 +5,8 @@
 use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s::{
-    PdbHealthInfo, PodHealthInfo, check_pdb_health, check_pod_health, create_k8s_client,
+    KubeconfigSource, PdbHealthInfo, PodHealthInfo, check_pdb_health, check_pod_health,
+    create_k8s_client_with_source,
 };
 use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
@@ -158,6 +159,9 @@ pub struct LifecycleComponent {
     /// K8s client for pod/PDB checks (reusable, not part of loaded data)
     k8s_client: Option<Client>,
 
+    /// Source of the kubeconfig (for display in UI)
+    k8s_source: Option<KubeconfigSource>,
+
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
 }
@@ -187,6 +191,7 @@ impl LifecycleComponent {
             auto_refresh: true,
             client: None,
             k8s_client: None,
+            k8s_source: None,
             config_path,
         }
     }
@@ -341,14 +346,24 @@ impl LifecycleComponent {
 
     /// Fetch pre-operation health checks into data
     async fn fetch_pre_op_checks_into(&mut self, data: &mut LifecycleData, client: &TalosClient) {
+        // Get a control plane node IP for kubeconfig fetch
+        // We try to get this from etcd members (only control plane nodes run etcd)
+        let cp_node_ip = match client.etcd_members().await {
+            Ok(members) => members.first().and_then(|m| m.ip_address()),
+            Err(_) => None,
+        };
+
         // Initialize K8s client if not already done
         if self.k8s_client.is_none() {
-            match create_k8s_client(client).await {
-                Ok(k8s) => {
+            match create_k8s_client_with_source(client, cp_node_ip.as_deref(), None).await {
+                Ok((k8s, source)) => {
+                    tracing::info!("K8s client created from: {:?}", source);
                     self.k8s_client = Some(k8s);
+                    self.k8s_source = Some(source);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create K8s client: {}", e);
+                    self.k8s_source = Some(KubeconfigSource::Unavailable(e.to_string()));
                 }
             }
         }
@@ -773,6 +788,43 @@ impl LifecycleComponent {
             ]));
         }
 
+        // K8s source info (show where kubeconfig came from)
+        let k8s_source_text = match &self.k8s_source {
+            Some(KubeconfigSource::Environment) => "via KUBECONFIG".to_string(),
+            Some(KubeconfigSource::TalosNode(node)) => format!("via node {}", node),
+            Some(KubeconfigSource::Unavailable(err)) => {
+                // Truncate long error messages
+                let short_err = if err.len() > 40 {
+                    format!("{}...", &err[..40])
+                } else {
+                    err.clone()
+                };
+                format!("unavailable: {}", short_err)
+            }
+            None => "not initialized".to_string(),
+        };
+
+        let k8s_color = match &self.k8s_source {
+            Some(KubeconfigSource::Environment) | Some(KubeconfigSource::TalosNode(_)) => {
+                Color::Green
+            }
+            _ => Color::DarkGray,
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if self.k8s_client.is_some() {
+                    "✓"
+                } else {
+                    "?"
+                },
+                Style::default().fg(k8s_color),
+            ),
+            Span::raw(" K8s: "),
+            Span::styled(k8s_source_text, Style::default().fg(k8s_color)),
+        ]));
+
         // Pod health check
         if let Some(ref pods) = pre_op_checks.pod_health {
             let has_issues = pods.has_issues();
@@ -801,11 +853,20 @@ impl LifecycleComponent {
                 Span::styled(summary, Style::default().fg(color)),
             ]));
         } else {
+            // Show hint about why pods are unavailable
+            let hint = match &self.k8s_source {
+                Some(KubeconfigSource::Unavailable(_)) => "set KUBECONFIG",
+                None => "loading...",
+                _ => "K8s API error",
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("?", Style::default().fg(Color::DarkGray)),
                 Span::raw(" Pods: "),
-                Span::styled("unavailable", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("unavailable ({})", hint),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
 
@@ -824,11 +885,20 @@ impl LifecycleComponent {
                 Span::styled(pdbs.summary(), Style::default().fg(color)),
             ]));
         } else {
+            // Show hint about why PDBs are unavailable
+            let hint = match &self.k8s_source {
+                Some(KubeconfigSource::Unavailable(_)) => "set KUBECONFIG",
+                None => "loading...",
+                _ => "K8s API error",
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("?", Style::default().fg(Color::DarkGray)),
                 Span::raw(" PDBs: "),
-                Span::styled("unavailable", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("unavailable ({})", hint),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
 
