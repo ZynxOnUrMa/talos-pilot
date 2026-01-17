@@ -33,6 +33,12 @@ pub struct TalosClient {
     nodes: Vec<String>,
     /// Endpoints from configuration (used to filter out vIPs from node targeting)
     endpoints: Vec<String>,
+    /// Decoded CA certificate PEM for creating additional connections
+    ca_pem: Vec<u8>,
+    /// Decoded client certificate PEM for creating additional connections
+    client_cert_pem: Vec<u8>,
+    /// Decoded client key PEM for creating additional connections
+    client_key_pem: Vec<u8>,
 }
 
 impl TalosClient {
@@ -42,10 +48,18 @@ impl TalosClient {
         let nodes = ctx.target_nodes().to_vec();
         let endpoints = ctx.endpoints.clone();
 
+        // Store certificates for creating additional connections
+        let ca_pem = ctx.ca_pem()?;
+        let client_cert_pem = ctx.client_cert_pem()?;
+        let client_key_pem = ctx.client_key_pem()?;
+
         Ok(Self {
             channel,
             nodes,
             endpoints,
+            ca_pem,
+            client_cert_pem,
+            client_key_pem,
         })
     }
 
@@ -68,12 +82,41 @@ impl TalosClient {
     /// Create a new client targeting a specific node
     ///
     /// This returns a clone of the client with requests directed to the specified node.
+    /// Note: This still uses the original channel (VIP), just with node targeting.
+    /// For direct connections, use `direct_to_node()` instead.
     pub fn with_node(&self, node: &str) -> Self {
         Self {
             channel: self.channel.clone(),
             nodes: vec![node.to_string()],
             endpoints: self.endpoints.clone(),
+            ca_pem: self.ca_pem.clone(),
+            client_cert_pem: self.client_cert_pem.clone(),
+            client_key_pem: self.client_key_pem.clone(),
         }
+    }
+
+    /// Create a new client with a direct connection to a specific node IP
+    ///
+    /// This creates a new gRPC channel directly to the specified node,
+    /// bypassing any VIP or load balancer. Use this when node targeting
+    /// through VIP is unreliable.
+    pub fn direct_to_node(&self, node_ip: &str) -> Result<Self, TalosError> {
+        let endpoint_url = format!("https://{}:50000", node_ip);
+        let channel = crate::auth::create_channel_to_endpoint(
+            &endpoint_url,
+            &self.ca_pem,
+            &self.client_cert_pem,
+            &self.client_key_pem,
+        )?;
+
+        Ok(Self {
+            channel,
+            nodes: vec![node_ip.to_string()],
+            endpoints: vec![endpoint_url],
+            ca_pem: self.ca_pem.clone(),
+            client_cert_pem: self.client_cert_pem.clone(),
+            client_key_pem: self.client_key_pem.clone(),
+        })
     }
 
     /// Get a MachineService client
@@ -156,7 +199,7 @@ impl TalosClient {
             if !valid_nodes.is_empty() {
                 let nodes_str = valid_nodes.join(",");
                 if let Ok(value) = nodes_str.parse() {
-                    request.metadata_mut().insert("nodes", value);
+                    request.metadata_mut().insert("node", value);
                 }
             }
         }
@@ -310,6 +353,165 @@ impl TalosClient {
             .collect();
 
         Ok(times)
+    }
+
+    /// Get version information from specific nodes using direct connections
+    ///
+    /// This bypasses VIP/node targeting and connects directly to each node.
+    /// Pass node IPs to query specific nodes.
+    pub async fn version_for_nodes(&self, nodes: &[String]) -> Result<Vec<VersionInfo>, TalosError> {
+        if nodes.is_empty() {
+            // No specific nodes, use standard method
+            return self.version().await;
+        }
+
+        let mut all_versions = Vec::new();
+
+        for node_ip in nodes {
+            let endpoint_url = format!("https://{}:50000", node_ip);
+
+            match crate::auth::create_channel_to_endpoint(
+                &endpoint_url,
+                &self.ca_pem,
+                &self.client_cert_pem,
+                &self.client_key_pem,
+            ) {
+                Ok(channel) => {
+                    let mut client = MachineServiceClient::new(channel);
+                    let request = Request::new(());
+
+                    match client.version(request).await {
+                        Ok(response) => {
+                            let inner = response.into_inner();
+                            for msg in inner.messages {
+                                all_versions.push(VersionInfo {
+                                    node: node_ip.clone(),
+                                    version: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.tag.clone())
+                                        .unwrap_or_default(),
+                                    sha: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.sha.clone())
+                                        .unwrap_or_default(),
+                                    built: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.built.clone())
+                                        .unwrap_or_default(),
+                                    go_version: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.go_version.clone())
+                                        .unwrap_or_default(),
+                                    os: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.os.clone())
+                                        .unwrap_or_default(),
+                                    arch: msg
+                                        .version
+                                        .as_ref()
+                                        .map(|v| v.arch.clone())
+                                        .unwrap_or_default(),
+                                    platform: msg
+                                        .platform
+                                        .as_ref()
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_default(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to get version from {}: {}", node_ip, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
+                }
+            }
+        }
+
+        Ok(all_versions)
+    }
+
+    /// Get time synchronization status from specific nodes using direct connections
+    ///
+    /// This bypasses VIP/node targeting and connects directly to each node.
+    pub async fn time_for_nodes(&self, nodes: &[String]) -> Result<Vec<NodeTimeInfo>, TalosError> {
+        use crate::proto::time::time_service_client::TimeServiceClient;
+
+        if nodes.is_empty() {
+            return self.time().await;
+        }
+
+        const SYNC_TOLERANCE_SECS: f64 = 1.0;
+        let mut all_times = Vec::new();
+
+        for node_ip in nodes {
+            let endpoint_url = format!("https://{}:50000", node_ip);
+
+            match crate::auth::create_channel_to_endpoint(
+                &endpoint_url,
+                &self.ca_pem,
+                &self.client_cert_pem,
+                &self.client_key_pem,
+            ) {
+                Ok(channel) => {
+                    let mut client = TimeServiceClient::new(channel);
+                    let request = Request::new(());
+
+                    match client.time(request).await {
+                        Ok(response) => {
+                            let inner = response.into_inner();
+                            for msg in inner.messages {
+                                let local_time = msg.localtime.map(|t| {
+                                    std::time::UNIX_EPOCH
+                                        + std::time::Duration::new(t.seconds as u64, t.nanos as u32)
+                                });
+                                let remote_time = msg.remotetime.map(|t| {
+                                    std::time::UNIX_EPOCH
+                                        + std::time::Duration::new(t.seconds as u64, t.nanos as u32)
+                                });
+
+                                let offset_seconds = match (msg.localtime, msg.remotetime) {
+                                    (Some(local), Some(remote)) => {
+                                        let local_nanos = local.seconds as f64 * 1_000_000_000.0
+                                            + local.nanos as f64;
+                                        let remote_nanos = remote.seconds as f64 * 1_000_000_000.0
+                                            + remote.nanos as f64;
+                                        (local_nanos - remote_nanos) / 1_000_000_000.0
+                                    }
+                                    _ => 0.0,
+                                };
+
+                                let synced = offset_seconds.abs() < SYNC_TOLERANCE_SECS;
+
+                                all_times.push(NodeTimeInfo {
+                                    node: node_ip.clone(),
+                                    server: msg.server,
+                                    local_time,
+                                    remote_time,
+                                    offset_seconds,
+                                    synced,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to get time from {}: {}", node_ip, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
+                }
+            }
+        }
+
+        Ok(all_times)
     }
 
     /// Get list of services from all configured nodes
@@ -678,31 +880,94 @@ impl TalosClient {
 
     /// Get etcd status from specific control plane nodes
     ///
-    /// Pass the hostnames from `etcd_members()` to get status from all control planes.
+    /// Pass the IPs from `etcd_members()` to get status from all control planes.
     /// If nodes is empty, queries only the endpoint node.
+    ///
+    /// Note: This makes individual calls to each node rather than using node targeting,
+    /// as node targeting through VIPs can be unreliable.
     pub async fn etcd_status_for_nodes(
         &self,
         nodes: &[String],
     ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
-        let mut client = self.machine_client();
-
-        let mut request = Request::new(());
-
-        // Add node targeting if specific nodes provided
-        if !nodes.is_empty() {
-            let nodes_str = nodes.join(",");
-            request
-                .metadata_mut()
-                .insert("nodes", nodes_str.parse().unwrap());
+        if nodes.is_empty() {
+            // No specific nodes, query via current endpoint
+            let mut client = self.machine_client();
+            let request = Request::new(());
+            let response = client.etcd_status(request).await?;
+            return self.parse_etcd_status_response(response.into_inner());
         }
 
-        let response = client.etcd_status(request).await?;
-        let inner = response.into_inner();
+        tracing::debug!(
+            "etcd_status_for_nodes querying {} nodes individually",
+            nodes.len()
+        );
 
-        let statuses: Vec<EtcdMemberStatus> = inner
+        // Query each node individually and collect results
+        let mut all_statuses = Vec::new();
+
+        for node_ip in nodes {
+            // Create endpoint URL for this specific node
+            let endpoint_url = format!("https://{}:50000", node_ip);
+            tracing::debug!("Querying etcd status from: {}", endpoint_url);
+
+            // Try to create a direct connection to this node using stored certificates
+            match crate::auth::create_channel_to_endpoint(
+                &endpoint_url,
+                &self.ca_pem,
+                &self.client_cert_pem,
+                &self.client_key_pem,
+            ) {
+                Ok(channel) => {
+                    let mut client = MachineServiceClient::new(channel);
+                    let request = Request::new(());
+
+                    match client.etcd_status(request).await {
+                        Ok(response) => {
+                            if let Ok(statuses) =
+                                self.parse_etcd_status_response(response.into_inner())
+                            {
+                                all_statuses.extend(statuses);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to get etcd status from {}: {}", node_ip, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
+                }
+            }
+        }
+
+        Ok(all_statuses)
+    }
+
+    /// Parse etcd status response into EtcdMemberStatus structs
+    fn parse_etcd_status_response(
+        &self,
+        response: crate::proto::machine::EtcdStatusResponse,
+    ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
+        tracing::debug!(
+            "etcd_status response: {} messages received",
+            response.messages.len()
+        );
+
+        let statuses: Vec<EtcdMemberStatus> = response
             .messages
             .into_iter()
             .filter_map(|msg| {
+                let has_status = msg.member_status.is_some();
+                let node_info = msg
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.hostname.as_str())
+                    .unwrap_or("unknown");
+                tracing::debug!(
+                    "etcd_status message from {}: has_status={}",
+                    node_info,
+                    has_status
+                );
                 msg.member_status.map(|status| EtcdMemberStatus {
                     node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                     member_id: status.member_id,
@@ -719,6 +984,10 @@ impl TalosClient {
             })
             .collect();
 
+        tracing::debug!(
+            "parse_etcd_status_response returning {} statuses",
+            statuses.len()
+        );
         Ok(statuses)
     }
 
@@ -2561,6 +2830,10 @@ mod tests {
             channel,
             nodes,
             endpoints,
+            // Empty certificates - not needed for filtering tests
+            ca_pem: Vec::new(),
+            client_cert_pem: Vec::new(),
+            client_key_pem: Vec::new(),
         }
     }
 

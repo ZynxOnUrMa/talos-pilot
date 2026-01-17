@@ -223,51 +223,8 @@ impl LifecycleComponent {
         // Get or create data
         let mut data = self.state.take_data().unwrap_or_default();
 
-        // Fetch version information
-        match client.version().await {
-            Ok(versions) => {
-                // Get context name from first node
-                if !versions.is_empty() && data.context_name.is_empty() {
-                    // Try to get from talosconfig
-                    let config_result = match &self.config_path {
-                        Some(path) => {
-                            let path_buf = std::path::PathBuf::from(path);
-                            TalosConfig::load_from(&path_buf)
-                        }
-                        None => TalosConfig::load_default(),
-                    };
-                    if let Ok(config) = config_result {
-                        data.context_name = config.context;
-                    }
-                }
-
-                data.versions = versions;
-            }
-            Err(e) => {
-                self.state
-                    .set_error(format!("Failed to fetch versions: {}", e));
-                // Re-store the data so far
-                self.state.set_data(data);
-                return Ok(());
-            }
-        }
-
-        // Fetch time sync status
-        match client.time().await {
-            Ok(times) => {
-                data.time_info = times;
-            }
-            Err(e) => {
-                // Time fetch failure is not fatal - just log it
-                tracing::warn!("Failed to fetch time status: {}", e);
-                data.time_info.clear();
-            }
-        }
-
-        // Fetch discovery members using context-aware async version
-        let context_name = if !data.context_name.is_empty() {
-            data.context_name.clone()
-        } else {
+        // First, determine context name
+        if data.context_name.is_empty() {
             let config_result = match &self.config_path {
                 Some(path) => {
                     let path_buf = std::path::PathBuf::from(path);
@@ -275,11 +232,13 @@ impl LifecycleComponent {
                 }
                 None => TalosConfig::load_default(),
             };
-            config_result
-                .map(|config| config.context)
-                .unwrap_or_default()
-        };
+            if let Ok(config) = config_result {
+                data.context_name = config.context.clone();
+            }
+        }
 
+        // Fetch discovery members early to get node IPs for direct connections
+        let context_name = data.context_name.clone();
         if !context_name.is_empty() {
             match get_discovery_members_for_context(&context_name, self.config_path.as_deref())
                 .await
@@ -292,6 +251,87 @@ impl LifecycleComponent {
                     data.discovery_members.clear();
                 }
             }
+        }
+
+        // Extract node IPs from discovery members for direct connections
+        // Each member has addresses - use the first one as the node IP
+        let node_ips: Vec<String> = data
+            .discovery_members
+            .iter()
+            .filter_map(|m| m.addresses.first().cloned())
+            .collect();
+
+        // Fetch version information using direct node connections
+        if !node_ips.is_empty() {
+            match client.version_for_nodes(&node_ips).await {
+                Ok(versions) => {
+                    data.versions = versions;
+                }
+                Err(e) => {
+                    self.state
+                        .set_error(format!("Failed to fetch versions: {}", e));
+                    self.state.set_data(data);
+                    return Ok(());
+                }
+            }
+        } else {
+            // Fallback: try etcd_members to get control plane IPs
+            match client.etcd_members().await {
+                Ok(members) => {
+                    let cp_ips: Vec<String> =
+                        members.iter().filter_map(|m| m.ip_address()).collect();
+                    if !cp_ips.is_empty() {
+                        match client.version_for_nodes(&cp_ips).await {
+                            Ok(versions) => {
+                                data.versions = versions;
+                            }
+                            Err(e) => {
+                                self.state
+                                    .set_error(format!("Failed to fetch versions: {}", e));
+                                self.state.set_data(data);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        self.state
+                            .set_error("No node IPs available for version query");
+                        self.state.set_data(data);
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    self.state
+                        .set_error(format!("Failed to fetch etcd members: {}", e));
+                    self.state.set_data(data);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fetch time sync status using direct node connections
+        let time_node_ips: Vec<String> = if !node_ips.is_empty() {
+            node_ips.clone()
+        } else {
+            // Use IPs from versions we just fetched
+            data.versions
+                .iter()
+                .map(|v| v.node.split(':').next().unwrap_or(&v.node).to_string())
+                .collect()
+        };
+
+        if !time_node_ips.is_empty() {
+            match client.time_for_nodes(&time_node_ips).await {
+                Ok(times) => {
+                    data.time_info = times;
+                }
+                Err(e) => {
+                    // Time fetch failure is not fatal - just log it
+                    tracing::warn!("Failed to fetch time status: {}", e);
+                    data.time_info.clear();
+                }
+            }
+        } else {
+            data.time_info.clear();
         }
 
         // Build node statuses combining version and time info
@@ -359,11 +399,10 @@ impl LifecycleComponent {
         let etcd_quorum = match client.etcd_members().await {
             Ok(members) => {
                 let total = members.len();
-                // Extract control plane hostnames to target status calls
-                let cp_hostnames: Vec<String> =
-                    members.iter().map(|m| m.hostname.clone()).collect();
+                // Extract control plane IPs to target status calls (hostnames may not be resolvable)
+                let cp_ips: Vec<String> = members.iter().filter_map(|m| m.ip_address()).collect();
                 // Try to get status from all control planes
-                let healthy = match client.etcd_status_for_nodes(&cp_hostnames).await {
+                let healthy = match client.etcd_status_for_nodes(&cp_ips).await {
                     Ok(statuses) => {
                         // Count members with status
                         members
