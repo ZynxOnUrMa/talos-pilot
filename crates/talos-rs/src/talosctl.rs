@@ -547,30 +547,79 @@ pub async fn get_discovery_members_for_context(
     parse_discovery_members_yaml(&output)
 }
 
-/// Get discovery members with automatic retry on transient failures.
-/// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+/// Get discovery members for a specific node IP using context certificates (async).
+///
+/// This allows querying a specific control plane node directly instead of going through the VIP.
+async fn get_discovery_members_for_node_async(
+    context: &str,
+    node_ip: &str,
+) -> Result<Vec<DiscoveryMember>, TalosError> {
+    let output = exec_talosctl_async(&[
+        "--context",
+        context,
+        "-n",
+        node_ip,
+        "get",
+        "members",
+        "-o",
+        "yaml",
+    ])
+    .await?;
+    parse_discovery_members_yaml(&output)
+}
+
+/// Get discovery members with automatic retry and fallback to specific nodes.
+///
+/// First tries the VIP endpoint (via context), then falls back to querying
+/// individual control plane nodes directly if the VIP fails.
+///
+/// This handles transient "no request forwarding" errors that occur when
+/// the VIP routes to a node that can't forward the request.
 pub async fn get_discovery_members_with_retry(
     context: &str,
     config_path: Option<&str>,
+    fallback_node_ips: &[String],
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    const MAX_RETRIES: u32 = 3;
+    // First, try the VIP-based approach with a couple retries
+    const VIP_RETRIES: u32 = 2;
     const BASE_DELAY_MS: u64 = 100;
 
     let mut last_error = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=VIP_RETRIES {
         match get_discovery_members_for_context(context, config_path).await {
             Ok(members) => return Ok(members),
             Err(e) => {
                 last_error = Some(e);
-                if attempt < MAX_RETRIES {
+                if attempt < VIP_RETRIES {
                     let delay_ms = BASE_DELAY_MS * (1 << attempt);
                     tracing::debug!(
-                        "Discovery fetch attempt {} failed, retrying in {}ms",
+                        "Discovery fetch via VIP attempt {} failed, retrying in {}ms",
                         attempt + 1,
                         delay_ms
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    // VIP failed, try fallback nodes directly
+    if !fallback_node_ips.is_empty() {
+        tracing::debug!(
+            "VIP-based discovery failed, trying {} fallback nodes directly",
+            fallback_node_ips.len()
+        );
+
+        for node_ip in fallback_node_ips {
+            match get_discovery_members_for_node_async(context, node_ip).await {
+                Ok(members) => {
+                    tracing::debug!("Successfully fetched discovery members from fallback node {}", node_ip);
+                    return Ok(members);
+                }
+                Err(e) => {
+                    tracing::debug!("Fallback node {} failed: {}", node_ip, e);
+                    last_error = Some(e);
                 }
             }
         }
