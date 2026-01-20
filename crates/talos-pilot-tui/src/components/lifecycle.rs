@@ -290,7 +290,12 @@ impl LifecycleComponent {
                 .iter()
                 .map(|v| v.node.split(':').next().unwrap_or(&v.node).to_string())
                 .collect();
-            match get_discovery_members_with_retry(&context_name, self.config_path.as_deref(), &fallback_ips).await
+            match get_discovery_members_with_retry(
+                &context_name,
+                self.config_path.as_deref(),
+                &fallback_ips,
+            )
+            .await
             {
                 Ok(members) => {
                     data.discovery_members = members;

@@ -471,7 +471,13 @@ impl ClusterComponent {
             .iter()
             .filter_map(|m| m.ip_address())
             .collect();
-        match get_discovery_members_with_retry(&context_name, self.config_path.as_deref(), &fallback_ips).await {
+        match get_discovery_members_with_retry(
+            &context_name,
+            self.config_path.as_deref(),
+            &fallback_ips,
+        )
+        .await
+        {
             Ok(members) => {
                 cluster.node_ips.clear();
                 for member in &members {
